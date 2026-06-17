@@ -5,16 +5,16 @@ ifeq ($(shell uname -m),x86_64)
 # Force cross-compile on x86 - never build native
 CC = loongarch64-unknown-linux-gnu-gcc
 AS = loongarch64-unknown-linux-gnu-as
-CFLAGS = -Wall -fPIC -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -DCONFIG_LOONGARCH_NEW_WORLD -DFRECIPE -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -Wno-array-bounds -mlsx -mfrecipe -ftls-model=initial-exec -Isrc/include
-DBG_CFLAGS = -Wall -fPIC -O0 -g -fvisibility=hidden -ffunction-sections -fdata-sections -DCONFIG_LOONGARCH_NEW_WORLD -DFRECIPE -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -Wno-array-bounds -mlsx -mfrecipe -ftls-model=initial-exec -Isrc/include
+CFLAGS = -Wall -fPIC -O2 -ffunction-sections -fdata-sections -DCONFIG_LOONGARCH_NEW_WORLD -DFRECIPE -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -Wno-array-bounds -mlsx -mfrecipe -ftls-model=initial-exec -Isrc/include
+DBG_CFLAGS = -Wall -fPIC -O0 -g -ffunction-sections -fdata-sections -DCONFIG_LOONGARCH_NEW_WORLD -DFRECIPE -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -Wno-array-bounds -mlsx -mfrecipe -ftls-model=initial-exec -Isrc/include
 QEMU = qemu-loongarch64-static
 QEMU_CPU = -cpu la464,lasx=off
 HOST_X86 = 1
 else
 # Default native build on LoongArch
 CC ?= gcc
-CFLAGS ?= -Wall -fPIC -O2 -fvisibility=hidden -ffunction-sections -fdata-sections -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -mlsx -ftls-model=initial-exec -Isrc/include
-DBG_CFLAGS ?= -Wall -fPIC -O0 -g -fvisibility=hidden -ffunction-sections -fdata-sections -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -mlsx -ftls-model=initial-exec -Isrc/include
+CFLAGS ?= -Wall -fPIC -O2 -ffunction-sections -fdata-sections -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -mlsx -ftls-model=initial-exec -Isrc/include
+DBG_CFLAGS ?= -Wall -fPIC -O0 -g -ffunction-sections -fdata-sections -Wno-strict-aliasing -Wno-aggressive-loop-optimizations -mlsx -ftls-model=initial-exec -Isrc/include
 HOST_X86 = 0
 
 # Detect ABI world on native LoongArch via ELF interpreter

@@ -16,6 +16,8 @@
 
 #define __USE_MISC
 #define __USE_GNU
+#define _GNU_SOURCE
+#include <dlfcn.h>
 #include "debug.h"
 #include "lasx_emu.h"
 #include "lasx_emu_private.h"
@@ -42,6 +44,7 @@ int lasx_interpret_frag_opt;
 // 保存原始的 SIGILL 处理函数
 static struct sigaction original_sigill_action;
 
+__thread bool is_lasx = 0;
 // 自定义 SIGILL 处理函数
 void sigill_handler(int sig, siginfo_t *info, void *context) {
   (void)sig;
@@ -56,19 +59,22 @@ void sigill_handler(int sig, siginfo_t *info, void *context) {
   
   if ((instr & 0x48000300) == 0x48000300) {
       //重新执行jiscr1
+      is_lasx = true;
       return;
   }
 
-  if (lasx_emu_create_interpret_fragment(ucontext)) { return; }
+  if (lasx_emu_create_interpret_fragment(ucontext)) { is_lasx = true; return; }
 
-  if (lasx_emu_create_interpret_block(ucontext)) { return; }
+  if (lasx_emu_create_interpret_block(ucontext)) { is_lasx = true; return; }
 
   if(lasx_emu_create_interpret(ucontext, instr)) {
+      is_lasx = true;
       return;
   }
   int ret = do_lasx_emu(ucontext, instr);
 
   if (ret) {
+    is_lasx = true;
     ucontext->uc_mcontext.__pc += 4;
   } else {
     // 打印指令地址和指令码
@@ -89,6 +95,108 @@ void sigill_handler(int sig, siginfo_t *info, void *context) {
   return;
 #endif
 }
+
+// 保存目标程序注册的动作
+static struct sigaction target_act = {0};
+static int target_registered = 0;
+
+// 原始 libc 函数指针
+typedef sighandler_t (*signal_t)(int, sighandler_t);
+typedef int (*sigaction_t)(int, const struct sigaction *, struct sigaction *);
+static signal_t original_signal = NULL;
+static sigaction_t original_sigaction = NULL;
+
+// 真实的 sigaction（绕过劫持，直接系统调用）
+static int real_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
+    return syscall(SYS_rt_sigaction, signum, act, oldact, _NSIG / 8);
+}
+
+// Wrapper 函数：被内核真正调用
+static void wrapper_handler(int sig, siginfo_t *info, void *context) {
+    if (sig == SIGILL) {
+        sigill_handler(sig, info, context);
+    }
+
+    if (is_lasx) {
+        is_lasx = false;
+        return;
+    }
+    if (target_registered) {
+        if (target_act.sa_flags & SA_SIGINFO) {
+            if (target_act.sa_sigaction) {
+                target_act.sa_sigaction(sig, info, context);
+            }
+        } else {
+            if (target_act.sa_handler && target_act.sa_handler != SIG_DFL && target_act.sa_handler != SIG_IGN) {
+                target_act.sa_handler(sig);
+            }
+        }
+    }
+}
+
+// 安装 wrapper（SA_SIGINFO 风格）
+static void install_wrapper(void) {
+    struct sigaction sa = {
+        .sa_sigaction = wrapper_handler,
+        .sa_flags = SA_SIGINFO,
+    };
+    sigemptyset(&sa.sa_mask);
+    if (target_registered) {
+        sa.sa_flags |= (target_act.sa_flags & ~SA_SIGINFO);
+        // 简化：不合并 mask，因为多数情况下无影响
+    }
+    real_sigaction(SIGILL, &sa, NULL);
+}
+
+// 劫持 signal
+sighandler_t signal(int signum, sighandler_t handler) {
+    if (signum == SIGILL) {
+        if (handler == SIG_ERR) return SIG_ERR;
+
+        sighandler_t old = SIG_DFL;
+        if (target_registered) {
+            old = (target_act.sa_flags & SA_SIGINFO) ?
+                  (sighandler_t)target_act.sa_sigaction : target_act.sa_handler;
+        } else {
+            old = (sighandler_t)sigill_handler;
+        }
+
+        memset(&target_act, 0, sizeof(target_act));
+        target_act.sa_handler = handler;
+        target_act.sa_flags = 0;
+        sigemptyset(&target_act.sa_mask);
+        target_registered = 1;
+
+        install_wrapper();
+        return old;
+    }
+    return original_signal(signum, handler);
+}
+
+// 劫持 sigaction
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
+    if (signum == SIGILL && act != NULL) {
+        if (oldact) {
+            if (target_registered) {
+                memcpy(oldact, &target_act, sizeof(struct sigaction));
+            } else {
+                memset(oldact, 0, sizeof(struct sigaction));
+                oldact->sa_sigaction = sigill_handler;
+                oldact->sa_flags = SA_SIGINFO;
+                sigemptyset(&oldact->sa_mask);
+            }
+        }
+
+        memcpy(&target_act, act, sizeof(struct sigaction));
+        target_registered = 1;
+
+        install_wrapper();
+        return 0;
+    }
+
+    return original_sigaction(signum, act, oldact);
+}
+
 
 // 析构函数：程序退出时打印最终统计
 __attribute__((destructor)) void cleanup_sigill_handler(void) {
@@ -211,10 +319,13 @@ __attribute__((constructor)) void register_sigill_handler(void) {
   sa.sa_flags = SA_SIGINFO; // 使用 sa_sigaction 而不是 sa_handler
 
   // 保存原来的处理函数，如果有的话
-  if (sigaction(SIGILL, &sa, &original_sigill_action) != 0) {
+  if (real_sigaction(SIGILL, &sa, &original_sigill_action) != 0) {
     perror("[SIGILL HOOK] sigaction 注册失败");
     return;
   }
+
+  original_signal = (signal_t) dlsym(RTLD_NEXT, "signal");
+  original_sigaction = (sigaction_t) dlsym(RTLD_NEXT, "sigaction");
 
 #ifdef LASX_PROFILE
   if (lasx_profile_mode & LASX_PROFILE_SIGNAL) {
