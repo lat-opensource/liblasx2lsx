@@ -46,6 +46,7 @@ static struct sigaction original_sigill_action;
 
 __thread bool is_lasx = 0;
 // 自定义 SIGILL 处理函数
+uint64_t tp_offset;
 void sigill_handler(int sig, siginfo_t *info, void *context) {
   (void)sig;
   (void)info;
@@ -61,6 +62,10 @@ void sigill_handler(int sig, siginfo_t *info, void *context) {
       //重新执行jiscr1
       is_lasx = true;
       return;
+  }
+
+  if (!tp_offset && getpid() == syscall(SYS_gettid)) {
+      tp_offset = (uint64_t)thread_data_get() - (uint64_t)(UC_GPR(ucontext, 2));
   }
 
   if (lasx_emu_create_interpret_fragment(ucontext)) { is_lasx = true; return; }

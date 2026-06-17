@@ -2157,10 +2157,13 @@ void __gen_lasx_interpret_xvrepl128vei_d_opt(void *as, unsigned int instr)
     gen_reg_restore_vr(as, vt[0]);
 }
 
+extern uint64_t tp_offset;
+
 int lasx_interpret_inst_gen(void *as, unsigned int instr, int with_prologue)
 {
     if (with_prologue) {
         la_pcaddi(as, LA_ZERO, 0);
+        la_addi_d(as, LA_TP, LA_TP, tp_offset);
     }
     int ok = 0;
     switch (instr >> 22) {
@@ -2899,6 +2902,7 @@ int lasx_interpret_inst_gen(void *as, unsigned int instr, int with_prologue)
     default: break;
     }
     if (with_prologue) {
+        la_addi_d(as, LA_TP, LA_TP, -tp_offset);
         la_jiscr0(as, 4);
     }
     return ok;

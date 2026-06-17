@@ -127,6 +127,7 @@ bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr)
 
 
 extern int lasx_interpret_mode;
+extern uint64_t tp_offset;
 
 bool lasx_emu_create_interpret_block(ucontext_t *uc)
 {
@@ -152,6 +153,8 @@ bool lasx_emu_create_interpret_block(ucontext_t *uc)
             return true;
         }
     }
+
+    la_addi_d(&as, LA_TP, LA_TP, tp_offset);
 
     /* ===== Phase 2: Translation ===== */
     int block_pidx = profile_emit(&as, entry, pc, PROFILE_NONE) ? profile_current_pidx() : 0;
@@ -223,6 +226,7 @@ bool lasx_emu_create_interpret_block(ucontext_t *uc)
     }
 
     /* ===== Phase 3: Finalize ===== */
+    la_addi_d(&as, LA_TP, LA_TP, -tp_offset);
     if (n) {
         la_jiscr0(&as, n * 4);
         profile_set(block_pidx, usedef_succeeded ? PROFILE_USEDEF : PROFILE_BLOCK, n);

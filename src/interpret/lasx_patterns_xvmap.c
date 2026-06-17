@@ -228,6 +228,8 @@ int check_xvmap_feasibility(unsigned int *p, int loop_len,
 
 #include "lasx_interpret_opt_reg.h"
 
+extern uint64_t tp_offset;
+
 void *generate_xvmap_loop(lagoon_assembler_t *as, unsigned int *p,
                                     int loop_start, int loop_len, uint32_t xvuse,
                                     uint32_t xv_insn_mask[4])
@@ -246,12 +248,14 @@ void *generate_xvmap_loop(lagoon_assembler_t *as, unsigned int *p,
     void *jit_entry = la_get_cursor(as);
 
     la_pcaddi(as, LA_ZERO, 0);
+    la_addi_d(as, LA_TP, LA_TP, tp_offset);
 
     as->xvmapped = 1;
     if (lasx_build_xvmap((int32_t)xvuse, as->xvmap)) {
         as->cursor = save_cursor;
         as->xvmapped = 0;
         assert(0 && "xvmap VR allocation failed");
+        la_addi_d(as, LA_TP, LA_TP, -tp_offset);
         return NULL;
     }
 
@@ -351,6 +355,7 @@ void *generate_xvmap_loop(lagoon_assembler_t *as, unsigned int *p,
     __gen_xvmap_epilogue(as, as->xvmap);
 
     int exit_offset = loop_len * 4;
+    la_addi_d(as, LA_TP, LA_TP, -tp_offset);
     la_jiscr0(as, exit_offset);
 
     as->xvmapped = 0;
@@ -558,6 +563,7 @@ bool __lasx_emu_create_interpret_fragment(ucontext_t *uc,
 retry:
     la_init_assembler(&as, entry, 0x1000);
     la_pcaddi(&as, LA_ZERO, 0);
+    la_addi_d(&as, LA_TP, LA_TP, tp_offset);
 
 //    printf("%s:%d range %d at %p\n", __func__, __LINE__, range, entry);
 
@@ -613,6 +619,7 @@ retry:
     }
 
 done:
+    la_addi_d(&as, LA_TP, LA_TP, -tp_offset);
     la_jiscr0(&as, n * 4);
 
     if (n) {
