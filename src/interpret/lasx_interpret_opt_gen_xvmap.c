@@ -104,45 +104,54 @@ void __gen_lasx_interpret_xvpermi_q_opt_xvmap(void *pas, unsigned int instr)
     int xd2 = as->xvmap[xd];
     int xj2 = as->xvmap[xj];
 
-    if (xd == xj && imm == 0x1) {
-        la_vxor_v(as, xj,  xj,  xj2);
-        la_vxor_v(as, xj2, xj2, xj);
-        la_vxor_v(as, xj,  xj,  xj2);
-        return;
-    }
-
     int q0 = (imm >> 0) & 0x3;
     int q1 = (imm >> 4) & 0x3;
 
     /* vec = {xd2, xd, xj2, xj}; q0/q1 select from vec[0..3].
        q0=3 reads xd2 which q1 overwrites. Do q0 first in that case. */
-    if (q0 == 3 && q1 != 3) {
-        /* q0-first: xd = original xd2, then xd2 = ... */
-        switch (q0) {
-        case 0: la_vori_b(as, xd, xj, 0); break;
-        case 1: la_vori_b(as, xd, xj2, 0); break;
-        case 2: la_vori_b(as, xd, xd, 0); break;
-        case 3: la_vori_b(as, xd, xd2, 0); break; /* xd = original xd2 */
+
+    if (xd == xj) {
+        if ((q0 == 0 || q0 == 2) && (q1 == 0 || q1 == 2)) {
+	    la_vori_b(as, xd2, xd, 0);
         }
-        switch (q1) {
-        case 0: la_vori_b(as, xd2, xj, 0); break;
-        case 1: la_vori_b(as, xd2, xj2, 0); break;
-        case 2: la_vori_b(as, xd2, xd, 0); break;
-        case 3: la_vori_b(as, xd2, xd2, 0); break;
+        if (q0 == 1 || q0 == 3) {
+	    if (q1 == 0 || q1 == 2) {
+		la_vxor_v(as, xd,  xd,  xd2);
+		la_vxor_v(as, xd2,  xd,  xd2);
+		la_vxor_v(as, xd,  xd,  xd2);
+	    } else {
+		la_vori_b(as, xd, xd2, 0);
+	    }
         }
     } else {
-        switch (q1) {
-        case 0: la_vori_b(as, xd2, xj, 0); break;
-        case 2: la_vori_b(as, xd2, xd, 0); break;
-        case 1: la_vori_b(as, xd2, xj2, 0); break;
-        case 3: la_vori_b(as, xd2, xd2, 0); break;
-        }
-
-        switch (q0) {
-        case 0: la_vori_b(as, xd, xj, 0); break;
-        case 2: la_vori_b(as, xd, xd, 0); break;
-        case 1: la_vori_b(as, xd, xj2, 0); break;
-        case 3: la_vori_b(as, xd, xd2, 0); break;
+        if (q0 == 0) {
+            switch (q1) {
+            case 0: la_vori_b(as, xd, xj, 0); la_vori_b(as, xd2, xj, 0); break;
+            case 1: la_vori_b(as, xd, xj, 0); la_vori_b(as, xd2, xj2, 0); break;
+            case 2: la_vori_b(as, xd2, xd, 0); la_vori_b(as, xd, xj, 0); break;
+            case 3: la_vori_b(as, xd, xj, 0); break;
+            }
+        } else if (q0 == 1) {
+            switch (q1) {
+            case 0: la_vori_b(as, xd, xj2, 0); la_vori_b(as, xd2, xj, 0); break;
+            case 1: la_vori_b(as, xd, xj2, 0); la_vori_b(as, xd2, xj2, 0); break;
+            case 2: la_vori_b(as, xd2, xd, 0); la_vori_b(as, xd, xj2, 0); break;
+            case 3: la_vori_b(as, xd, xj2, 0); break;
+            }
+        } else if (q0 == 2) {
+            switch (q1) {
+            case 0: la_vori_b(as, xd2, xj, 0); break;
+            case 1: la_vori_b(as, xd2, xj2, 0); break;
+            case 2: la_vori_b(as, xd2, xd, 0); break;
+            case 3: break;
+            }
+        } else {
+            switch (q1) {
+            case 0: la_vori_b(as, xd, xd2, 0); la_vori_b(as, xd2, xj, 0); break;
+            case 1: la_vori_b(as, xd, xd2, 0); la_vori_b(as, xd2, xj2, 0); break;
+            case 2: la_vxor_v(as, xd,  xd,  xd2); la_vxor_v(as, xd2,  xd,  xd2); la_vxor_v(as, xd,  xd,  xd2); break;
+            case 3: la_vori_b(as, xd, xd2, 0); break;
+            }
         }
     }
 }
@@ -357,13 +366,12 @@ void __gen_lasx_interpret_xvpermi_d_opt_xvmap(void *pas, unsigned int instr)
         la_vst(as, xj,  LA_TP, TD_OFF_DATA(xj, 0));
         la_vst(as, xj2, LA_TP, TD_OFF_DATA(xj, 2));
 
-        la_vld(as, xj,  LA_TP, TD_OFF_DATA(xj, 0));
         la_vshuf4i_d(as, xd,    xj2, (imm >> 0) & 0xf);
-
-        la_vld(as, xj,  LA_TP, TD_OFF_DATA(xj, 0));
-        la_vori_b(as, xd2, xj, 0);
-        la_vld(as, xj,  LA_TP, TD_OFF_DATA(xj, 2));
-        la_vshuf4i_d(as, xd2,   xj, (imm >> 4) & 0xf);
+        la_vst(as, xd, LA_TP, TD_OFF_DATA(xj, 2));
+        la_vld(as, xd, LA_TP, TD_OFF_DATA(xj, 0));
+        la_vshuf4i_d(as, xd,   xj2, (imm >> 4) & 0xf);
+        la_vori_b(as, xd2, xd, 0);
+        la_vld(as, xd, LA_TP, TD_OFF_DATA(xj, 2));
     } else {
         la_vori_b(as, xd, xj, 0);
         la_vshuf4i_d(as, xd, xj2, (imm >> 0) & 0xf);
