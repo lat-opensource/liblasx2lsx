@@ -29,8 +29,19 @@ static __attribute__((noinline)) void asm_test(void *mem)
         "xvst $xr2, %0, 64\n"
         :
         : "r"(mem)
-        : "memory", "$xr0", "$xr1", "$xr2"
-    );
+        : "memory", "$xr0", "$xr1", "$xr2");
+}
+
+static __attribute__((noinline)) void asm_test_fresh(void *mem)
+{
+    __asm__ volatile(
+        "xvld $xr0, %0, 0\n"
+        "xvld $xr1, %0, 32\n"
+        "xvadd.b $xr2, $xr0, $xr1\n"
+        "xvst $xr2, %0, 64\n"
+        :
+        : "r"(mem)
+        : "memory", "$xr0", "$xr1", "$xr2");
 }
 
 // 每个线程独立运行测试，使用本地内存（栈上分配）
@@ -50,10 +61,18 @@ void *test_xvadd_b(void *arg) {
         b[i] = i * 5 + 2;      // 2,7,12,...
     }
 
-    // 执行 xvadd.b
-    asm_test(mem);
-    asm_test(mem);
-    asm_test(mem);
+    // Thread 2 starts a fresh block with SCR1 cleared, reproducing the case
+    // where block translation returned before initializing the signal context.
+    if (thread_id == 2) {
+        __asm__ volatile("movgr2scr $scr1, $zero" ::: "memory");
+        asm_test_fresh(mem);
+        asm_test_fresh(mem);
+        asm_test_fresh(mem);
+    } else {
+        asm_test(mem);
+        asm_test(mem);
+        asm_test(mem);
+    }
 
     // 验证结果
     uint8_t *c = (uint8_t *)(mem + 64);

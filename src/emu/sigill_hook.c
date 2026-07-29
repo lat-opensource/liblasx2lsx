@@ -34,6 +34,8 @@
 #include <unistd.h>
 #include "lasx_interpret.h"
 #include <larchintrin.h>
+#include <errno.h>
+#include <pthread.h>
 
 int use_lsx_intrinsics;
 #ifdef LASX_PROFILE
@@ -57,7 +59,9 @@ void sigill_handler(int sig, siginfo_t *info, void *context) {
 #if defined(__loongarch__)
   unsigned long pc_val = ucontext->uc_mcontext.__pc;
   unsigned int instr = *(unsigned int *)pc_val;
-  
+
+  lasx_interpret_prepare_context(ucontext);
+
   if ((instr & 0x48000300) == 0x48000300) {
       //重新执行jiscr1
       is_lasx = true;
@@ -110,6 +114,46 @@ typedef sighandler_t (*signal_t)(int, sighandler_t);
 typedef int (*sigaction_t)(int, const struct sigaction *, struct sigaction *);
 static signal_t original_signal = NULL;
 static sigaction_t original_sigaction = NULL;
+
+typedef int (*pthread_create_t)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
+static pthread_create_t original_pthread_create = NULL;
+
+typedef struct {
+  void* (*start_routine)(void*);
+  void* arg;
+} thread_start_info_t;
+
+static void* thread_start_wrapper(void* opaque)
+{
+  thread_start_info_t* info = opaque;
+  void* (*start_routine)(void*) = info->start_routine;
+  void* arg = info->arg;
+  free(info);
+
+  lasx_interpret_prepare_thread();
+  return start_routine(arg);
+}
+
+int pthread_create(pthread_t* thread, const pthread_attr_t* attr, void* (*start_routine)(void*), void* arg)
+{
+  if (!original_pthread_create) {
+    original_pthread_create = (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
+    if (!original_pthread_create)
+      return ENOSYS;
+  }
+
+  thread_start_info_t* info = malloc(sizeof(*info));
+  if (!info)
+    return ENOMEM;
+
+  info->start_routine = start_routine;
+  info->arg = arg;
+
+  int ret = original_pthread_create(thread, attr, thread_start_wrapper, info);
+  if (ret)
+    free(info);
+  return ret;
+}
 
 // 真实的 sigaction（绕过劫持，直接系统调用）
 static int real_sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) {
@@ -329,8 +373,9 @@ __attribute__((constructor)) void register_sigill_handler(void) {
     return;
   }
 
-  original_signal = (signal_t) dlsym(RTLD_NEXT, "signal");
-  original_sigaction = (sigaction_t) dlsym(RTLD_NEXT, "sigaction");
+  original_signal = (signal_t)dlsym(RTLD_NEXT, "signal");
+  original_sigaction = (sigaction_t)dlsym(RTLD_NEXT, "sigaction");
+  original_pthread_create = (pthread_create_t)dlsym(RTLD_NEXT, "pthread_create");
 
 #ifdef LASX_PROFILE
   if (lasx_profile_mode & LASX_PROFILE_SIGNAL) {

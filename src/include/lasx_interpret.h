@@ -54,6 +54,8 @@ extern uint64_t (*__mov_scr3_gr)(void);
     (offsetof(thread_data_t, gpr[id]))
 
 void lasx_init_interpret(void);
+void lasx_interpret_prepare_thread(void);
+void lasx_interpret_prepare_context(ucontext_t *uc);
 void interpret_lock(void);
 void interpret_unlock(void);
 bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr);
