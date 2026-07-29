@@ -74,7 +74,23 @@ uint64_t (*__mov_scr1_gr)(void);
 uint64_t (*__mov_scr2_gr)(void);
 uint64_t (*__mov_scr3_gr)(void);
 
+void lasx_interpret_prepare_thread(void)
+{
+  if (!interpreter_entry || !__mov_gr_scr1 || !__mov_gr_scr2)
+    return;
 
+  __mov_gr_scr1((uint64_t)interpreter_entry);
+  __mov_gr_scr2((uint64_t)thread_data_get());
+}
+
+void lasx_interpret_prepare_context(ucontext_t *uc)
+{
+  if (!interpreter_entry)
+    return;
+
+  UC_SET_SCR(uc, 1, (uint64_t)interpreter_entry);
+  UC_SET_SCR(uc, 2, (uint64_t)thread_data_get());
+}
 
 bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr)
 {
@@ -84,10 +100,7 @@ bool lasx_emu_create_interpret(ucontext_t *uc, unsigned int instr)
     interpret_lock();
 
     uintptr_t pc = UC_PC(uc);
-    thread_data_t *td = thread_data_get();
-
-    UC_SET_SCR(uc, 1, (uint64_t)interpreter_entry);
-    UC_SET_SCR(uc, 2, (uint64_t)td);
+    lasx_interpret_prepare_context(uc);
 
     int n = 0;
     void *entry = interpreter_entry_ptr;
@@ -347,27 +360,7 @@ void lasx_init_interpret(void)
       }
 #endif
     
-      /*
-       * SCR1 is a per-CPU register. Initialize it on every online CPU so
-       * that future threads created on any CPU inherit the correct
-       * interpreter_entry via OS context. This is a one-time hack because
-       * we are loaded via LD_PRELOAD and don't know how many threads the
-       * application will create.
-       */
-      {
-          cpu_set_t saved_mask;
-          sched_getaffinity(0, sizeof(saved_mask), &saved_mask);
-          int ncpu = get_nprocs();
-          for (int cpu = 0; cpu < ncpu; cpu++) {
-              cpu_set_t mask;
-              CPU_ZERO(&mask);
-              CPU_SET(cpu, &mask);
-              sched_setaffinity(0, sizeof(mask), &mask);
-              usleep(1);
-              __mov_gr_scr1((uint64_t)interpreter_entry);
-          }
-          sched_setaffinity(0, sizeof(saved_mask), &saved_mask);
-      }
+      lasx_interpret_prepare_thread();
     } else {
       tdlog("interpret mmap fail\n");
     }
