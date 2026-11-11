@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: GPL-2.0-only
+obj-m := lasx2lsx.o
+lasx2lsx-y := lasx2lsx_kmod.o lasx_rt_blob.o
+
+ccflags-y := -I$(src) -g0
+asflags-y := -I$(src) -Wa,-I$(src)

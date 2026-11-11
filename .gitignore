@@ -7,6 +7,7 @@
 # Test binaries
 test_*
 !tests/test_*.c
+!kmod/tests/test_*.c
 
 # Debug symbols
 *_dbg.o
@@ -73,4 +74,24 @@ coverage/
 graphify-out/
 src/graphify-out/
 debian/pkg/
+debian/pkg-dkms/
 *.deb
+
+# Kernel module (kmod) build artifacts
+kmod/rt/build/
+kmod/lasx_rt.bin
+kmod/lasx_rt_meta.h
+kmod/dkms.conf
+kmod/*.ko
+kmod/*.o
+kmod/*.mod
+kmod/*.mod.c
+kmod/*.mod.o
+kmod/.*.cmd
+kmod/modules.order
+kmod/Module.symvers
+kmod/.tmp_versions/
+kmod/.cache.mk
+kmod/tests/test_lasx_raw_ri
+kmod/tests/test_lasx_suite
+kmod/tests/test_lasx_static

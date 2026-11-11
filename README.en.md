@@ -2,7 +2,10 @@
 
 # liblasx2lsx
 
-LASX (LoongArch SIMD Extension, 256-bit vector instruction) software emulation library via SIGILL trap + LD_PRELOAD.
+LASX (LoongArch SIMD Extension, 256-bit vector instruction) software emulation and binary translation suite, offering two operating modes:
+
+1. **On-Demand Kernel Module (`lasx2lsx.ko` / `liblasx2lsx-dkms`, recommended)**: Intercepts reserved-instruction traps in the kernel and injects a freestanding PIE runtime on demand — **requiring neither `LD_PRELOAD` nor `/etc/ld.so.preload`**, imposing zero overhead on non-LASX processes, and supporting env-sanitizing launchers, statically linked (`-static`) binaries, runtimes with custom `SIGILL` handlers, and strict `W^X` code pages.
+2. **Userspace Preload Library (`liblasx2lsx.so`)**: Runs purely in userspace without kernel privileges via `LD_PRELOAD` + `SIGILL` signal interception.
 
 ## Use Case
 
@@ -56,10 +59,13 @@ If you only need to use the library (no building), grab a pre-built `.so` — no
 ## Building
 
 ```bash
-make          # Build all: liblasx2lsx.so + debug build
+make          # Build userspace libraries: liblasx2lsx.so + debug + profile
+make deb      # Build userspace package liblasx2lsx_1.0.0_loongarch64.deb
+make deb-dkms # Build on-demand DKMS package liblasx2lsx-dkms_1.0.0_all.deb
+make kmod     # Build kmod/lasx2lsx.ko directly against the running LoongArch kernel
 make clean    # Clean build artifacts
 make debug    # Debug build only (liblasx2lsx_dbg.so)
-make profile # Profile build (liblasx2lsx_profile.so)
+make profile  # Profile build (liblasx2lsx_profile.so)
 ```
 
 LoongArch hosts use native `gcc`.
@@ -121,6 +127,49 @@ LIBLASX2LSX_INTERPRET=off LD_PRELOAD=./liblasx2lsx.so ./your_binary
 
 The entire process is transparent to the target program — no code modification or relinking required.
 
+### On-Demand Kernel Module (`LD_PRELOAD`-Free, DKMS)
+
+For system-wide transparent compatibility (e.g. desktop launchers that strip `LD_PRELOAD`, wrapper scripts, `-static` binaries, or Go/JVM/browser runtimes with custom `SIGILL` handlers), install `liblasx2lsx-dkms`:
+
+- **Strict Platform Gating**: By default, the module initializes **strictly on Loongson 3B6000M / 2K3000** (LSX + LBT, no hardware LASX). On CPUs with native LASX (such as 3A6000), module initialization refuses to load (`-ENODEV`) so native performance is never affected.
+- **Zero Global Overhead**: Processes that never execute LASX instructions receive zero extra mappings.
+- **Multi-Thread & `fork()` Safe**: Uses first-use LBT `EXCCODE_BTDIS` traps to lazily bind `$scr1`/`$scr2` per thread, automatically recycling 64KB context slots from exited threads.
+
+#### Install & Enable (3B6000M / 2K3000)
+
+```bash
+# Build and install the DKMS package (builds for the running kernel and auto-loads at boot)
+make deb-dkms
+sudo dpkg -i liblasx2lsx-dkms_1.0.0_all.deb
+
+# Run any LASX binary directly without LD_PRELOAD:
+./your_lasx_binary
+```
+
+Runtime JIT tuning and observability via sysfs:
+
+```bash
+# Inspect or switch JIT mode (default: usedef,loop,frag; options: block / one / off)
+cat /sys/module/lasx2lsx/parameters/interpret_mode
+echo block | sudo tee /sys/module/lasx2lsx/parameters/interpret_mode
+
+# Inspect trap and injection counters
+head /sys/module/lasx2lsx/parameters/stat_*
+```
+
+#### Simulation & Verification on 3A6000
+
+3A6000 is supported strictly for verification by passing `sim_3a6000=1` together with a mandatory `target_comm` prefix filter (intercepting `do_lasx` to simulate 3B6000M reserved-instruction traps):
+
+```bash
+make kmod kmod-tests
+sudo insmod kmod/lasx2lsx.ko sim_3a6000=1 target_comm=test_lasx
+env -i ./kmod/tests/test_lasx_raw_ri
+env -i ./kmod/tests/test_lasx_suite
+env -i ./kmod/tests/test_lasx_static
+sudo rmmod lasx2lsx
+```
+
 ## Testing
 
 ```bash
@@ -140,6 +189,11 @@ src/
 ├── interpret/        # JIT translation layer (batch translation + optimization)
 └── lagoon.c          # LoongArch assembler (instruction encoding emission)
 
+kmod/                 # LD_PRELOAD-free on-demand kernel module & DKMS packaging
+├── lasx2lsx_kmod.c   # Kernel module (trap hook, lazy injection, LBT init, W^X COW patch)
+├── rt/               # Freestanding PIE runtime glue and build scripts
+└── tests/            # Freestanding (-nostdlib), static (-static), MT, and W^X tests
+
 tools/                # Utility scripts
 tests/                # Unit tests
 random_test/          # Random test framework (703 instructions)
@@ -156,4 +210,5 @@ Architecture details, debugging guide, and known bug patterns:
 
 ## License
 
-MIT
+- Userspace library and JIT core (`src/`): MIT
+- Kernel module (`kmod/`): GPL-2.0-only (shared protocol header and runtime glue dual-licensed under `GPL-2.0-only OR MIT`)

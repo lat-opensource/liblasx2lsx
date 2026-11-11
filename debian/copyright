@@ -32,3 +32,14 @@ Copyright: 2023 Loongson Technology Corporation Limited
 License: GPL-2.0-only
  Extended context magic values and structures derived from
  Linux kernel arch/loongarch/include/uapi/asm/sigcontext.h.
+
+Files: kmod/lasx2lsx_kmod.c kmod/lasx_rt_blob.S kmod/Makefile kmod/Kbuild
+Copyright: 2026 liblasx2lsx contributors
+License: GPL-2.0-only
+ Linux kernel module sources licensed under GPL-2.0-only.
+
+Files: kmod/lasx_kproto.h kmod/rt/* kmod/tests/*
+Copyright: 2026 liblasx2lsx contributors
+License: GPL-2.0-only or MIT
+ Dual-licensed under GPL-2.0-only or MIT for shared kernel/userspace
+ protocol headers, freestanding PIE runtime glue, and verification tests.

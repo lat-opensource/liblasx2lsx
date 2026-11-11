@@ -2,7 +2,10 @@
 
 # liblasx2lsx
 
-LASX（LoongArch SIMD Extension，256 位向量指令）软件模拟库，通过 SIGILL 信号捕获 + LD_PRELOAD 实现。
+LASX（LoongArch SIMD Extension，256 位向量指令）软件模拟与二进制翻译方案，提供两种工作模式：
+
+1. **按需加载内核模块（`lasx2lsx.ko` / `liblasx2lsx-dkms`，推荐）**：内核态拦截保留指令陷阱并按需注入独立 PIE 运行时，**无需设置 `LD_PRELOAD` 或 `/etc/ld.so.preload`**，对未执行 LASX 的普通进程零开销，原生支持清空环境变量启动器、静态链接（`-static`）程序、自定义 `SIGILL` 信号处理器的运行时及严格 `W^X` 代码页。
+2. **用户态预加载库（`liblasx2lsx.so`）**：无需内核权限，通过 `LD_PRELOAD` + `SIGILL` 信号捕获在纯用户态完成模拟与 JIT 翻译。
 
 ## 应用场景
 
@@ -56,10 +59,13 @@ gcc -mlsx                           # 编译本库需要 -mlsx 支持 (LSX 128�
 ## 编译
 
 ```bash
-make          # 编译全部：liblasx2lsx.so + 调试版
+make          # 编译全部用户态库：liblasx2lsx.so + 调试版 + 性能分析版
+make deb      # 打包用户态库 liblasx2lsx_1.0.0_loongarch64.deb
+make deb-dkms # 打包按需加载内核模块 liblasx2lsx-dkms_1.0.0_all.deb
+make kmod     # 在目标 LoongArch 机器针对当前内核直接编译 kmod/lasx2lsx.ko
 make clean    # 清理编译产物
 make debug    # 仅调试版 (liblasx2lsx_dbg.so)
-make profile # 性能分析版 (liblasx2lsx_profile.so)
+make profile  # 性能分析版 (liblasx2lsx_profile.so)
 ```
 
 LoongArch 主机使用 `gcc` 本地编译。
@@ -121,6 +127,49 @@ LIBLASX2LSX_INTERPRET=off LD_PRELOAD=./liblasx2lsx.so ./your_binary
 
 整个过程对目标程序完全透明，无需修改代码或重新链接。
 
+### 按需加载内核模块（免 `LD_PRELOAD`，DKMS）
+
+对于系统级透明兼容场景（例如桌面应用启动器清理 `LD_PRELOAD`、脚本包装程序、静态链接二进制、或 Go/JVM/浏览器自定义 `SIGILL` 处理器），可安装 `liblasx2lsx-dkms`：
+
+- **生产平台门禁**：模块默认**仅在龙芯 3B6000M / 2K3000**（支持 LSX + LBT、硬件无 LASX）上初始化并自动生效；在 3A6000 等原生支持 LASX 的处理器上默认拒绝加载（返回 `-ENODEV`），避免误伤硬件性能。
+- **零全局污染**：未触发 LASX 指令的进程不注入任何内存映射、不占用额外虚拟地址空间。
+- **多线程与 `fork()` 透明兼容**：结合 LBT `EXCCODE_BTDIS` 首次使用陷阱按需为任意线程绑定 `$scr1`/`$scr2`，退出线程的 64KB 上下文槽位自动回收复用。
+
+#### 安装与启用（3B6000M / 2K3000）
+
+```bash
+# 构建并安装 DKMS 包（自动针对当前内核编译并在启动时按需加载）
+make deb-dkms
+sudo dpkg -i liblasx2lsx-dkms_1.0.0_all.deb
+
+# 此后直接运行包含 LASX 指令的任意程序，无需设置 LD_PRELOAD：
+./your_lasx_binary
+```
+
+可通过 sysfs 动态调整翻译模式或查看运行统计：
+
+```bash
+# 查看或切换 JIT 优化模式（默认 usedef,loop,frag；可选 block / one / off）
+cat /sys/module/lasx2lsx/parameters/interpret_mode
+echo block | sudo tee /sys/module/lasx2lsx/parameters/interpret_mode
+
+# 查看按需注入与陷阱统计
+head /sys/module/lasx2lsx/parameters/stat_*
+```
+
+#### 在 3A6000 上模拟验证
+
+3A6000 仅用于开发验证，需显式开启 `sim_3a6000=1` 并指定 `target_comm` 进程名前缀过滤（拦截 `do_lasx` 模拟 3B6000M 保留指令陷阱）：
+
+```bash
+make kmod kmod-tests
+sudo insmod kmod/lasx2lsx.ko sim_3a6000=1 target_comm=test_lasx
+env -i ./kmod/tests/test_lasx_raw_ri
+env -i ./kmod/tests/test_lasx_suite
+env -i ./kmod/tests/test_lasx_static
+sudo rmmod lasx2lsx
+```
+
 ## 测试
 
 ```bash
@@ -138,6 +187,11 @@ src/
 ├── interpret/        # JIT 解释层（批量翻译 + 优化）
 └── lagoon.c          # LoongArch 汇编器（指令编码发射）
 
+kmod/                 # 免 LD_PRELOAD 按需加载内核模块与 DKMS 配置
+├── lasx2lsx_kmod.c   # 内核模块主体（陷阱拦截、按需映射、LBT 延迟初始化、W^X COW 补丁）
+├── rt/               # 无 libc 依赖的独立 PIE 运行时胶水与构建脚本
+└── tests/            # 裸机 (-nostdlib)、静态链接 (-static)、多线程与 W^X 专项测试
+
 tools/                # 辅助脚本
 tests/                # 单元测试
 random_test/          # 随机测试框架（703 条指令）
@@ -154,4 +208,5 @@ doc/
 
 ## 许可
 
-MIT
+- 用户态模拟库与 JIT 核心（`src/`）：MIT
+- 内核模块（`kmod/`）：GPL-2.0-only（共享协议与运行时胶水 `GPL-2.0-only OR MIT` 双许可）

@@ -1046,3 +1046,44 @@ void do_lasx_emu_xvsrln_b_h(ucontext_t* uc, unsigned int instr)
    - B[24-31] → D3 (slot 3) - 需清零
 
 4. **高半部分清零**：使用 vreg_write_64 一次性清零整个 slot
+
+## 内核按需加载方案 (`kmod/` & `liblasx2lsx-dkms`)
+
+除 `LD_PRELOAD=./liblasx2lsx.so` 用户态方案外，`kmod/` 目录实现了无需 `LD_PRELOAD`、无需 `/etc/ld.so.preload`、对信号/TLS/线程/环境变量零侵入的内核按需注入方案（`lasx2lsx.ko`）：
+
+### 目录结构
+
+```
+kmod/
+├── lasx_kproto.h       # 内核与独立 PIE 运行时共享的 64KB 线程上下文协议头
+├── lasx2lsx_kmod.c     # 内核模块（DIE_RI 拦截、按需映射、LBT $scr1/$scr2 延迟绑定、W^X COW 补丁）
+├── lasx_rt_blob.S      # 通过 .incbin 嵌入预构建的 lasx_rt.bin
+├── Kbuild / Makefile   # Out-of-tree Kbuild 构建规则
+├── dkms.conf.in        # DKMS 配置模板
+├── lasx2lsx.service    # systemd 启动单元（仅在 3B6000M / 2K3000 自动加载）
+├── rt/                 # 无 libc 依赖的独立 PIE 运行时构建目录（复用 src/emu 与 src/interpret）
+└── tests/              # 裸机（-nostdlib）、静态链接（-static）、多线程与 W^X 专项测试集
+```
+
+### 平台初始化约束（生产环境仅支持 3B6000M / 2K3000）
+
+- **生产模式（默认 `sim_3a6000=0`）**：模块初始化时严格校验处理器型号，**仅在龙芯 3B6000M / 2K3000（LA364 系列，支持 LSX + LBT 且硬件无 LASX）上允许加载**；在 3A6000 等原生支持 LASX 的平台上默认返回 `-ENODEV` 拒绝初始化，避免误伤原生性能。
+- **3A6000 验证模式（仅测试用途）**：需显式传入 `sim_3a6000=1 target_comm=<进程名前缀>`（禁止空前缀或 `*`），额外拦截 `EXCCODE_LASXDIS`（`do_lasx`）以模拟 3B6000M / 2K3000 的保留指令例外。
+
+### 构建与验证命令
+
+```bash
+make kmod-rt      # 构建独立 PIE 运行时镜像 (kmod/lasx_rt.bin + kmod/lasx_rt_meta.h)
+make deb-dkms     # 生成 liblasx2lsx-dkms_1.0.0_all.deb（可在 x86_64 交叉构建或在 LoongArch 本地构建）
+make kmod         # 在 LoongArch 目标机针对当前内核构建 kmod/lasx2lsx.ko
+make kmod-tests   # 构建 kmod/tests/ 下的按需模拟验证测试集
+
+# 在 3B6000M / 2K3000 生产环境加载：
+sudo modprobe lasx2lsx
+
+# 在 3A6000 上模拟验证（必须指定 target_comm）：
+sudo modprobe lasx2lsx sim_3a6000=1 target_comm=test_lasx
+env -i ./kmod/tests/test_lasx_raw_ri
+env -i ./kmod/tests/test_lasx_suite
+env -i ./kmod/tests/test_lasx_static
+```

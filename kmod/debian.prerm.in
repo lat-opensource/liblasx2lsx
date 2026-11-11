@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+DKMS_NAME="lasx2lsx"
+DKMS_VER="@PACKAGE_VERSION@"
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        /sbin/modprobe -r lasx2lsx 2>/dev/null || true
+        rm -f /etc/systemd/system/sysinit.target.wants/lasx2lsx.service
+        if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        if command -v dkms >/dev/null 2>&1; then
+            if dkms status -m "$DKMS_NAME" -v "$DKMS_VER" 2>/dev/null | grep -q "$DKMS_NAME"; then
+                unset ARCH
+                dkms remove -m "$DKMS_NAME" -v "$DKMS_VER" --all || true
+            fi
+        fi
+        ;;
+esac
+
+exit 0

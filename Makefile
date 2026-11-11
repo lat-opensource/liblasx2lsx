@@ -480,6 +480,8 @@ DEB_ARCH = $(shell dpkg --print-architecture 2>/dev/null || uname -m)
 endif
 
 DEB_PKG = $(CURDIR)/liblasx2lsx_$(DEB_VERSION)_$(DEB_ARCH).deb
+DEB_DKMS_PKG = $(CURDIR)/liblasx2lsx-dkms_$(DEB_VERSION)_all.deb
+DKMS_SRC_SUBDIR = usr/src/lasx2lsx-$(DEB_VERSION)
 
 deb: $(TARGET)
 	rm -rf debian/pkg
@@ -488,16 +490,54 @@ deb: $(TARGET)
 	ln -sf $(TARGET).$(DEB_VERSION) debian/pkg/usr/lib/$(TARGET).1
 	ln -sf $(TARGET).1 debian/pkg/usr/lib/$(TARGET)
 	cp $(INCLUDE_DIR)/lasx_emu.h debian/pkg/usr/include/
-	cp LICENSE debian/pkg/usr/share/doc/$(TARGET:.so=)/copyright
+	cp debian/copyright debian/pkg/usr/share/doc/$(TARGET:.so=)/copyright
 	cp debian/changelog debian/pkg/usr/share/doc/$(TARGET:.so=)/changelog
 	gzip -9 -n debian/pkg/usr/share/doc/$(TARGET:.so=)/changelog
 	echo "Package: $(TARGET:.so=)" > debian/pkg/DEBIAN/control
 	echo "Version: $(DEB_VERSION)" >> debian/pkg/DEBIAN/control
 	echo "Architecture: $(DEB_ARCH)" >> debian/pkg/DEBIAN/control
-	grep -E '^(Maintainer|Depends|Description|Section|Priority)' debian/control >> debian/pkg/DEBIAN/control
-	dpkg-deb --build -Zxz debian/pkg $(DEB_PKG)
+	awk '/^Package: liblasx2lsx-dkms/{exit} /^(Maintainer|Depends|Section|Priority):/{print} /^Description:/{desc=1; print; next} desc && /^ /{print; next} {desc=0}' debian/control >> debian/pkg/DEBIAN/control
+	dpkg-deb --root-owner-group --build -Zxz debian/pkg $(DEB_PKG)
 	rm -rf debian/pkg
 	@echo "Package: $(DEB_PKG)"
+
+# On-demand kernel module & DKMS packaging targets
+kmod-rt:
+	$(MAKE) -C kmod/rt
+
+kmod: kmod-rt
+	$(MAKE) -C kmod modules
+
+kmod-tests:
+	$(MAKE) -C kmod/tests
+
+deb-dkms: kmod-rt
+	rm -rf debian/pkg-dkms
+	mkdir -p debian/pkg-dkms/DEBIAN \
+		debian/pkg-dkms/$(DKMS_SRC_SUBDIR) \
+		debian/pkg-dkms/usr/lib/systemd/system \
+		debian/pkg-dkms/usr/share/doc/liblasx2lsx-dkms
+	sed 's/@PACKAGE_VERSION@/$(DEB_VERSION)/g' kmod/dkms.conf.in \
+		> debian/pkg-dkms/$(DKMS_SRC_SUBDIR)/dkms.conf
+	cp kmod/Makefile kmod/Kbuild kmod/lasx_kproto.h kmod/lasx_rt_meta.h \
+		kmod/lasx_rt.bin kmod/lasx_rt_blob.S kmod/lasx2lsx_kmod.c \
+		debian/pkg-dkms/$(DKMS_SRC_SUBDIR)/
+	cp kmod/lasx2lsx.service debian/pkg-dkms/usr/lib/systemd/system/
+	cp debian/copyright debian/pkg-dkms/usr/share/doc/liblasx2lsx-dkms/copyright
+	cp debian/changelog debian/pkg-dkms/usr/share/doc/liblasx2lsx-dkms/changelog
+	gzip -9 -n debian/pkg-dkms/usr/share/doc/liblasx2lsx-dkms/changelog
+	echo "Package: liblasx2lsx-dkms" > debian/pkg-dkms/DEBIAN/control
+	echo "Version: $(DEB_VERSION)" >> debian/pkg-dkms/DEBIAN/control
+	echo "Architecture: all" >> debian/pkg-dkms/DEBIAN/control
+	awk '/^(Maintainer|Priority):/ && !pkg {print} /^Package: liblasx2lsx-dkms/{pkg=1; next} pkg && /^(Section|Depends):/{print} pkg && /^Description:/{desc=1; print; next} pkg && desc && /^ /{print; next} pkg && !/^ /{desc=0}' debian/control >> debian/pkg-dkms/DEBIAN/control
+	sed 's/@PACKAGE_VERSION@/$(DEB_VERSION)/g' kmod/debian.postinst.in \
+		> debian/pkg-dkms/DEBIAN/postinst
+	sed 's/@PACKAGE_VERSION@/$(DEB_VERSION)/g' kmod/debian.prerm.in \
+		> debian/pkg-dkms/DEBIAN/prerm
+	chmod 0755 debian/pkg-dkms/DEBIAN/postinst debian/pkg-dkms/DEBIAN/prerm
+	dpkg-deb --root-owner-group --build -Zxz debian/pkg-dkms $(DEB_DKMS_PKG)
+	rm -rf debian/pkg-dkms
+	@echo "Package: $(DEB_DKMS_PKG)"
 
 # Cross-compilation for LoongArch (use: make cross CROSS_COMPILE=loongarch64-unknown-linux-gnu-)
 cross: CC = $(CROSS_COMPILE)gcc
@@ -510,6 +550,10 @@ clean:
 	rm -f $(INTERPRET_DIR)/*.o $(INTERPRET_DIR)/*.d
 	rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*.d
 	rm -f *.o *.d
+	$(MAKE) -C kmod clean
+	$(MAKE) -C kmod/tests clean
+	rm -f kmod/dkms.conf
+	rm -rf debian/pkg debian/pkg-dkms
 
 clean-all: clean
 	rm -f $(RANDOM_TEST_DIR)
@@ -696,4 +740,4 @@ coverage: clean-coverage
 	@echo "=== Generating coverage report ==="
 	$(MAKE) coverage-report
 
-.PHONY: all release debug profile cross clean clean-all test test-native test-loop test-block build-random-tests test-single test-single-native test-random-compare test-boundary test-verbose verify-coverage gen_boundary boundary-data unittest-loop test-usedef-batch coverage clean-coverage coverage-report
+.PHONY: all release debug profile cross clean clean-all deb deb-dkms kmod-rt kmod kmod-tests test test-native test-loop test-block build-random-tests test-single test-single-native test-random-compare test-boundary test-verbose verify-coverage gen_boundary boundary-data unittest-loop test-usedef-batch coverage clean-coverage coverage-report

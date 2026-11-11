@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+DKMS_NAME="lasx2lsx"
+DKMS_VER="@PACKAGE_VERSION@"
+
+case "$1" in
+    configure)
+        unset ARCH
+        if command -v dkms >/dev/null 2>&1; then
+            if ! dkms status -m "$DKMS_NAME" -v "$DKMS_VER" 2>/dev/null | grep -q "$DKMS_NAME"; then
+                dkms add -m "$DKMS_NAME" -v "$DKMS_VER"
+            fi
+            KVER="$(uname -r)"
+            if [ -d "/lib/modules/$KVER/build" ]; then
+                dkms build -m "$DKMS_NAME" -v "$DKMS_VER" -k "$KVER"
+                dkms install -m "$DKMS_NAME" -v "$DKMS_VER" -k "$KVER" --force
+            else
+                echo "liblasx2lsx-dkms: /lib/modules/$KVER/build not found; skipping build for $KVER." >&2
+            fi
+        fi
+
+        if [ -d /etc/systemd/system ]; then
+            mkdir -p /etc/systemd/system/sysinit.target.wants
+            ln -sf /usr/lib/systemd/system/lasx2lsx.service \
+                /etc/systemd/system/sysinit.target.wants/lasx2lsx.service
+            if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+                systemctl daemon-reload >/dev/null 2>&1 || true
+            fi
+        fi
+
+        if grep -qE "3B6000M|2K3000" /proc/cpuinfo 2>/dev/null; then
+            /sbin/modprobe lasx2lsx 2>/dev/null || true
+        fi
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,14 @@
+[Unit]
+Description=LoongArch LASX-to-LSX On-Demand Emulation Kernel Module
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'if grep -qE "3B6000M|2K3000" /proc/cpuinfo; then /sbin/modprobe lasx2lsx; fi'
+ExecStop=/bin/sh -c '/sbin/modprobe -r lasx2lsx 2>/dev/null || true'
+
+[Install]
+WantedBy=sysinit.target

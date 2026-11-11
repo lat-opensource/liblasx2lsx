@@ -19,3 +19,16 @@ Description: LASX instruction emulation library
   - Loop detection and xvmap-based loop JIT
   - Multi-thread safe via pthread TLS
   - MIT licensed
+
+Package: liblasx2lsx-dkms
+Section: kernel
+Architecture: all
+Depends: dkms (>= 2.1.0.0)
+Description: On-demand LD_PRELOAD-free LASX emulation kernel module (DKMS)
+ Kernel-assisted on-demand LASX-to-LSX binary translation module
+ (lasx2lsx.ko) for Loongson 3B6000M and 2K3000 processors.
+ .
+ Intercepts reserved-instruction traps on 256-bit LASX instructions
+ transparently without LD_PRELOAD, /etc/ld.so.preload, signals, TLS,
+ or pthread hooks, supporting static binaries, setuid/env-sanitized
+ programs, multi-threaded workloads, and strict W^X code pages.
