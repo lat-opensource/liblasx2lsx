@@ -26,7 +26,7 @@
 struct kernel_sigaction {
     void (*k_sa_handler)(int, void*, void*);
     unsigned long sa_flags;
-    unsigned long sa_mask;
+    unsigned long sa_mask[2];
 };
 
 struct mini_siginfo {
@@ -51,12 +51,12 @@ static long sys_write(int fd, const void* buf, size_t len)
     return a0;
 }
 
-static long sys_rt_sigaction(int sig, const struct kernel_sigaction* act)
+static long sys_rt_sigaction(int sig, const struct kernel_sigaction* act, unsigned long mask_size)
 {
     register long a0 __asm__("$a0") = sig;
     register long a1 __asm__("$a1") = (long)act;
     register long a2 __asm__("$a2") = 0;
-    register long a3 __asm__("$a3") = 8;
+    register long a3 __asm__("$a3") = mask_size;
     register long a7 __asm__("$a7") = NR_RT_SIGACTION;
     __asm__ volatile("syscall 0" : "+r"(a0) : "r"(a1), "r"(a2), "r"(a3), "r"(a7) : "memory", "$t0", "$t1", "$t2", "$t3", "$t4", "$t5", "$t6", "$t7", "$t8");
     return a0;
@@ -134,8 +134,11 @@ int probe_main(int argc, char** argv)
     struct kernel_sigaction ksa;
     ksa.k_sa_handler = sigill_handler;
     ksa.sa_flags = SA_SIGINFO_FLG;
-    ksa.sa_mask = 0;
-    if (sys_rt_sigaction(SIGILL_NUM, &ksa) != 0) {
+    ksa.sa_mask[0] = ksa.sa_mask[1] = 0;
+    long ret = sys_rt_sigaction(SIGILL_NUM, &ksa, 8);
+    if (ret == -22) /* Loongnix 4.19 uses a 128-bit kernel signal set. */
+        ret = sys_rt_sigaction(SIGILL_NUM, &ksa, 16);
+    if (ret != 0) {
         print_str("[FAIL] sys_rt_sigaction failed\n");
         return 2;
     }

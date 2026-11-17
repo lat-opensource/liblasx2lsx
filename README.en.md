@@ -131,6 +131,8 @@ The entire process is transparent to the target program — no code modification
 
 For system-wide transparent compatibility (e.g. desktop launchers that strip `LD_PRELOAD`, wrapper scripts, `-static` binaries, or Go/JVM/browser runtimes with custom `SIGILL` handlers), install `liblasx2lsx-dkms`:
 
+On 4.19 kernels, the module currently requires a non-preemptible configuration and a matching exception-entry instruction layout; it refuses to load otherwise. It has been tested in 3A6000 simulation mode on Loongnix `4.19.0-19-loongson-3`.
+
 - **Strict Platform Gating**: By default, the module initializes **strictly on Loongson 3B6000M / 2K3000** (LSX + LBT, no hardware LASX). On CPUs with native LASX (such as 3A6000), module initialization refuses to load (`-ENODEV`) so native performance is never affected.
 - **Zero Global Overhead**: Processes that never execute LASX instructions receive zero extra mappings.
 - **Multi-Thread & `fork()` Safe**: Uses first-use LBT `EXCCODE_BTDIS` traps to lazily bind `$scr1`/`$scr2` per thread, automatically recycling 64KB context slots from exited threads.

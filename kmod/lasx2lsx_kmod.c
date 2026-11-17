@@ -24,13 +24,17 @@
 #include <linux/ctype.h>
 #include <linux/hashtable.h>
 #include <linux/init.h>
+#if __has_include(<linux/instrumentation.h>)
 #include <linux/instrumentation.h>
+#endif
 #include <linux/kdebug.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
+#if __has_include(<linux/mmap_lock.h>)
 #include <linux/mmap_lock.h>
+#endif
 #include <linux/mmu_notifier.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -48,11 +52,16 @@
 #include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/version.h>
+#include <linux/wait.h>
 
 #include <asm/cpu-features.h>
 #include <asm/cpu-info.h>
 #include <asm/cpu.h>
+#if __has_include(<asm/loongarch.h>)
 #include <asm/loongarch.h>
+#else
+#include <asm/loongarchregs.h>
+#endif
 #include <asm/ptrace.h>
 #include <asm/thread_info.h>
 
@@ -61,6 +70,10 @@
 
 #ifndef noinstr
 #define noinstr
+#endif
+
+#ifndef cpu_has_iocsr
+#define cpu_has_iocsr (read_cpucfg(LOONGARCH_CPUCFG1) & CPUCFG1_IOCSR)
 #endif
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
@@ -253,6 +266,18 @@ static u32 saved_lasx_insns[4];
 static u32 saved_lbt_insns[4];
 static u32 patched_lasx_insns[4];
 static u32 patched_lbt_insns[4];
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+static u32 saved_ri_insns[4];
+static u32 patched_ri_insns[4];
+static atomic_t active_traps = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(active_traps_wait);
+
+static void lasx_trap_exit(void)
+{
+    if (atomic_dec_and_test(&active_traps))
+        wake_up(&active_traps_wait);
+}
+#endif
 
 /* LoongArch exception vector slot layout (CSR_EENTRY + exccode * 0x200):
  *   +0x114: 0x00150064 (move $a0, $sp)
@@ -264,11 +289,23 @@ static u32 patched_lbt_insns[4];
  */
 #define VEC_SLOT_STRIDE 0x200UL
 #define VEC_MOVE_A0_SP_IDX (0x114 / 4)
-#define VEC_LOAD_T0_IDX (0x118 / 4)
-#define VEC_JIRL_RA_T0_IDX (0x128 / 4)
 
 #define INSN_MOVE_A0_SP 0x00150064U
 #define INSN_JIRL_RA_T0 0x4c000181U
+
+/* Loongnix 4.19 uses a different prologue for each exception. */
+static unsigned int vec_move_idx(int exccode)
+{
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    if (exccode == EXCCODE_INE)
+        return 0x11c / 4;
+    if (exccode == EXCCODE_LASXDIS)
+        return 0xf4 / 4;
+    if (exccode == EXCCODE_BTDIS)
+        return 0x120 / 4;
+#endif
+    return VEC_MOVE_A0_SP_IDX;
+}
 
 static void encode_t0_imm64(unsigned long addr, u32 out[4])
 {
@@ -284,16 +321,17 @@ static int decode_and_verify_vec_target(unsigned long eentry, int exccode, unsig
     u32 i0, i1, i2, i3;
     u32 check[4];
     unsigned long addr;
+    unsigned int move_idx = vec_move_idx(exccode);
 
-    if (vec[VEC_MOVE_A0_SP_IDX] != INSN_MOVE_A0_SP || vec[VEC_JIRL_RA_T0_IDX] != INSN_JIRL_RA_T0) {
-        pr_err("lasx2lsx: exccode %d prologue/call mismatch (%08x / %08x)\n", exccode, vec[VEC_MOVE_A0_SP_IDX], vec[VEC_JIRL_RA_T0_IDX]);
+    if ((vec[move_idx] != INSN_MOVE_A0_SP && vec[move_idx] != 0x00410064U) || vec[move_idx + 5] != INSN_JIRL_RA_T0) {
+        pr_err("lasx2lsx: exccode %d prologue/call mismatch (%08x / %08x)\n", exccode, vec[move_idx], vec[move_idx + 5]);
         return -EINVAL;
     }
 
-    i0 = vec[VEC_LOAD_T0_IDX + 0];
-    i1 = vec[VEC_LOAD_T0_IDX + 1];
-    i2 = vec[VEC_LOAD_T0_IDX + 2];
-    i3 = vec[VEC_LOAD_T0_IDX + 3];
+    i0 = vec[move_idx + 1];
+    i1 = vec[move_idx + 2];
+    i2 = vec[move_idx + 3];
+    i3 = vec[move_idx + 4];
 
     if ((i0 & 0xfe00001fU) != 0x1400000cU || (i1 & 0xffc003ffU) != 0x0380018cU || (i2 & 0xfe00001fU) != 0x1600000cU || (i3 & 0xffc003ffU) != 0x0300018cU) {
         pr_err("lasx2lsx: exccode %d t0 imm64 pattern mismatch (%08x %08x %08x %08x)\n", exccode, i0, i1, i2, i3);
@@ -969,10 +1007,32 @@ static int lasx_die_handler(struct notifier_block* nb, unsigned long val, void* 
     return NOTIFY_STOP;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 static struct notifier_block lasx_die_nb = {
     .notifier_call = lasx_die_handler,
     .priority = 100,
 };
+#endif
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+/* The 4.19 die chain is atomic; call the sleepable handler before entering it. */
+static int lasx_handle_trap(struct pt_regs* regs, int trapnr)
+{
+    struct die_args args = { .regs = regs, .trapnr = trapnr };
+
+    if (!user_mode(regs) || irqs_disabled())
+        return NOTIFY_DONE;
+    return lasx_die_handler(NULL, DIE_RI, &args);
+}
+
+static asmlinkage void my_do_ri(struct pt_regs* regs)
+{
+    atomic_inc(&active_traps);
+    if (lasx_handle_trap(regs, EXCCODE_INE) != NOTIFY_STOP)
+        orig_do_ri(regs);
+    lasx_trap_exit();
+}
+#endif
 
 /*
  * Intercepted EXCCODE_LASXDIS (17) handler — ONLY installed when sim_3a6000=1.
@@ -981,14 +1041,27 @@ static struct notifier_block lasx_die_nb = {
  */
 static asmlinkage void noinstr my_do_lasx(struct pt_regs* regs)
 {
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    atomic_inc(&active_traps);
+#endif
     if (!user_mode(regs) || !should_intercept_current()) {
         lasx_noinstr_atomic_inc(&cnt_lasx_passthrough);
         orig_do_lasx(regs);
-        return;
+        goto out;
     }
 
     lasx_noinstr_atomic_inc(&cnt_lasx_intercepted);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    if (lasx_handle_trap(regs, EXCCODE_LASXDIS) != NOTIFY_STOP)
+        orig_do_ri(regs);
+#else
     orig_do_ri(regs);
+#endif
+out:
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    lasx_trap_exit();
+#endif
+    return;
 }
 
 /*
@@ -1001,20 +1074,49 @@ static asmlinkage void noinstr my_do_lbt(struct pt_regs* regs)
     bool was_used_lbt = test_ti_thread_flag(task_thread_info(current), TIF_USEDLBT);
     struct lasx_mm_ctx* mctx;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    atomic_inc(&active_traps);
+#endif
     orig_do_lbt(regs);
 
     if (was_used_lbt || !user_mode(regs))
-        return;
+        goto out;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    rcu_read_lock();
+    mctx = lookup_mm_ctx_rcu(current->mm);
+#else
     mctx = lookup_mm_ctx_irqoff(current->mm);
+#endif
     if (mctx) {
-        if (!(regs->csr_era >= mctx->rt_base && regs->csr_era < mctx->rt_base + LASX_RT_TOTAL_SIZE)) {
+        bool outside_rt = !(regs->csr_era >= mctx->rt_base && regs->csr_era < mctx->rt_base + LASX_RT_TOTAL_SIZE);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+        rcu_read_unlock();
+        if (outside_rt)
+            lasx_handle_trap(regs, EXCCODE_BTDIS);
+#else
+        if (outside_rt) {
             orig_do_ri(regs);
         }
+#endif
     } else if (should_intercept_current() && READ_ONCE(enable_runtime)) {
         /* Handle fork()ed child whose mm inherited jiscr1 sites from parent */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+        rcu_read_unlock();
+        lasx_handle_trap(regs, EXCCODE_BTDIS);
+#else
         orig_do_ri(regs);
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    } else {
+        rcu_read_unlock();
+#endif
     }
+out:
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    lasx_trap_exit();
+#endif
+    return;
 }
 
 struct cpu_verify_ctx {
@@ -1047,6 +1149,9 @@ struct sm_patch_req {
     bool patch_lasx;
     u32 lasx_insns[4];
     u32 lbt_insns[4];
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    u32 ri_insns[4];
+#endif
 };
 
 static void write_local_eentry_vectors(const struct sm_patch_req* req)
@@ -1055,13 +1160,18 @@ static void write_local_eentry_vectors(const struct sm_patch_req* req)
     u32* vec_lbt = (u32*)(eentry + (unsigned long)EXCCODE_BTDIS * VEC_SLOT_STRIDE);
     int i;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    u32* vec_ri = (u32*)(eentry + (unsigned long)EXCCODE_INE * VEC_SLOT_STRIDE);
     for (i = 0; i < 4; i++)
-        WRITE_ONCE(vec_lbt[VEC_LOAD_T0_IDX + i], req->lbt_insns[i]);
+        WRITE_ONCE(vec_ri[vec_move_idx(EXCCODE_INE) + 1 + i], req->ri_insns[i]);
+#endif
+    for (i = 0; i < 4; i++)
+        WRITE_ONCE(vec_lbt[vec_move_idx(EXCCODE_BTDIS) + 1 + i], req->lbt_insns[i]);
 
     if (req->patch_lasx) {
         u32* vec_lasx = (u32*)(eentry + (unsigned long)EXCCODE_LASXDIS * VEC_SLOT_STRIDE);
         for (i = 0; i < 4; i++)
-            WRITE_ONCE(vec_lasx[VEC_LOAD_T0_IDX + i], req->lasx_insns[i]);
+            WRITE_ONCE(vec_lasx[vec_move_idx(EXCCODE_LASXDIS) + 1 + i], req->lasx_insns[i]);
     }
 
     __asm__ volatile("dbar 0\n\tibar 0" ::: "memory");
@@ -1078,6 +1188,9 @@ static int lasx_cpu_online(unsigned int cpu)
 {
     unsigned long eentry = csr_read64(LOONGARCH_CSR_EENTRY);
     unsigned long fn_lbt = 0, fn_lasx = 0;
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    unsigned long fn_ri = 0;
+#endif
     unsigned long flags;
     struct sm_patch_req req;
 
@@ -1085,6 +1198,11 @@ static int lasx_cpu_online(unsigned int cpu)
     if (!eentry)
         return 0;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    if (decode_and_verify_vec_target(eentry, EXCCODE_INE, &fn_ri, NULL) != 0 ||
+        (fn_ri != (unsigned long)orig_do_ri && fn_ri != (unsigned long)my_do_ri))
+        return 0;
+#endif
     if (decode_and_verify_vec_target(eentry, EXCCODE_BTDIS, &fn_lbt, NULL) != 0)
         return 0;
     if (fn_lbt == (unsigned long)my_do_lbt && (!g_patch_lasxdis))
@@ -1095,6 +1213,9 @@ static int lasx_cpu_online(unsigned int cpu)
     req.patch_lasx = g_patch_lasxdis;
     memcpy(req.lasx_insns, patched_lasx_insns, sizeof(patched_lasx_insns));
     memcpy(req.lbt_insns, patched_lbt_insns, sizeof(patched_lbt_insns));
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    memcpy(req.ri_insns, patched_ri_insns, sizeof(patched_ri_insns));
+#endif
 
     local_irq_save(flags);
     write_local_eentry_vectors(&req);
@@ -1111,6 +1232,10 @@ static int __init lasx2lsx_kmod_init(void)
     struct sm_patch_req req;
     int ret;
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) && defined(CONFIG_PREEMPT)
+    pr_err("lasx2lsx: preemptible 4.19 kernels are not supported\n");
+    return -EOPNOTSUPP;
+#endif
     ret = lasx_check_platform(cpu_model);
     if (ret)
         return ret;
@@ -1121,7 +1246,13 @@ static int __init lasx2lsx_kmod_init(void)
         return -EINVAL;
     }
 
-    ret = decode_and_verify_vec_target(local_eentry, EXCCODE_INE, &fn_ri, NULL);
+    ret = decode_and_verify_vec_target(local_eentry, EXCCODE_INE, &fn_ri,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+                                       saved_ri_insns
+#else
+                                       NULL
+#endif
+    );
     if (ret)
         return ret;
     ret = decode_and_verify_vec_target(local_eentry, EXCCODE_BTDIS, &fn_lbt, saved_lbt_insns);
@@ -1147,11 +1278,15 @@ static int __init lasx2lsx_kmod_init(void)
     orig_do_lasx = (loongarch_exc_fn_t)fn_lasx;
     orig_do_lbt = (loongarch_exc_fn_t)fn_lbt;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
     ret = register_die_notifier(&lasx_die_nb);
     if (ret) {
         pr_err("lasx2lsx: register_die_notifier failed: %d\n", ret);
         return ret;
     }
+#else
+    encode_t0_imm64((unsigned long)my_do_ri, patched_ri_insns);
+#endif
 
     encode_t0_imm64((unsigned long)my_do_lasx, patched_lasx_insns);
     encode_t0_imm64((unsigned long)my_do_lbt, patched_lbt_insns);
@@ -1159,10 +1294,15 @@ static int __init lasx2lsx_kmod_init(void)
     req.patch_lasx = g_patch_lasxdis;
     memcpy(req.lasx_insns, patched_lasx_insns, sizeof(patched_lasx_insns));
     memcpy(req.lbt_insns, patched_lbt_insns, sizeof(patched_lbt_insns));
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    memcpy(req.ri_insns, patched_ri_insns, sizeof(patched_ri_insns));
+#endif
 
     ret = stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
     if (ret) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
         unregister_die_notifier(&lasx_die_nb);
+#endif
         pr_err("lasx2lsx: stop_machine vector patch failed: %d\n", ret);
         return ret;
     }
@@ -1193,10 +1333,20 @@ static void __exit lasx2lsx_kmod_exit(void)
     req.patch_lasx = g_patch_lasxdis;
     memcpy(req.lasx_insns, saved_lasx_insns, sizeof(saved_lasx_insns));
     memcpy(req.lbt_insns, saved_lbt_insns, sizeof(saved_lbt_insns));
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    memcpy(req.ri_insns, saved_ri_insns, sizeof(saved_ri_insns));
+#endif
 
     stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    /* No new wrappers can start; wait for sleeping handlers and their returns. */
+    wait_event(active_traps_wait, atomic_read(&active_traps) == 0);
+    synchronize_sched();
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
     unregister_die_notifier(&lasx_die_nb);
+#endif
 
     /* Unregister mmu_notifiers for any still-running processes */
     for (;;) {
