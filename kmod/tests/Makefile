@@ -7,7 +7,7 @@ endif
 
 CFLAGS := -O2 -Wall -Wextra -mlasx
 
-TARGETS := test_lasx_raw_ri test_lasx_suite test_lasx_static
+TARGETS := test_lasx_raw_ri test_lasx_suite test_lasx_static test_lasx_fork
 
 .PHONY: all clean
 
@@ -21,6 +21,9 @@ test_lasx_suite: test_lasx_suite.c ../lasx_kproto.h
 
 test_lasx_static: test_lasx_static.c
 	$(CC) $(CFLAGS) -static -o $@ $<
+
+test_lasx_fork: test_lasx_fork.c
+	$(CC) $(CFLAGS) -pthread -o $@ $<
 
 clean:
 	rm -f $(TARGETS)

@@ -133,6 +133,8 @@ LIBLASX2LSX_INTERPRET=off LD_PRELOAD=./liblasx2lsx.so ./your_binary
 
 4.19 内核目前仅支持非抢占配置，且异常入口必须与模块校验的指令布局一致；不符合条件时模块会拒绝加载。已在 Loongnix `4.19.0-19-loongson-3` 上使用 3A6000 模拟模式验证。
 
+名称过滤只控制首次注入。已注入进程的工作线程改名后创建子进程，子进程仍会恢复继承的模拟运行时；执行 `exec` 换成新程序后重新判断范围。新版内核通过校验原异常处理函数的 `irqentry_enter/exit` 调用来建立可等待的处理上下文，布局不匹配时拒绝加载，并要求启用 `CONFIG_TRACEPOINTS`，用于清理因致命信号而不再返回的异常处理。已在 AOSC `6.18.27` 上使用 3A6000 模拟模式验证。
+
 - **生产平台门禁**：模块默认**仅在龙芯 3B6000M / 2K3000**（支持 LSX + LBT、硬件无 LASX）上初始化并自动生效；在 3A6000 等原生支持 LASX 的处理器上默认拒绝加载（返回 `-ENODEV`），避免误伤硬件性能。
 - **零全局污染**：未触发 LASX 指令的进程不注入任何内存映射、不占用额外虚拟地址空间。
 - **多线程与 `fork()` 透明兼容**：结合 LBT `EXCCODE_BTDIS` 首次使用陷阱按需为任意线程绑定 `$scr1`/`$scr2`，退出线程的 64KB 上下文槽位自动回收复用。
@@ -169,6 +171,8 @@ sudo insmod kmod/lasx2lsx.ko sim_3a6000=1 target_comm=test_lasx
 env -i ./kmod/tests/test_lasx_raw_ri
 env -i ./kmod/tests/test_lasx_suite
 env -i ./kmod/tests/test_lasx_static
+env -i ./kmod/tests/test_lasx_fork
+sudo ./kmod/tests/test_lasx_fork --disable-runtime
 sudo rmmod lasx2lsx
 ```
 

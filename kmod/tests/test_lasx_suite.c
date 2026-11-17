@@ -127,6 +127,7 @@ struct mt_arg {
 
 static void* mt_worker(void* argp)
 {
+    pthread_setname_np(pthread_self(), "codec-worker");
     struct mt_arg* arg = (struct mt_arg*)argp;
     int32_t a[8] __attribute__((aligned(32)));
     int32_t b[8] __attribute__((aligned(32)));
@@ -350,6 +351,18 @@ static int run_core_checks(int is_clean_env_child)
     printf("[PASS] Test 3 (sigaction(SIGILL) coexistence): LASX silent, real illegal insn delivered to user handler (addr=%p, passthrough+%ld)\n", g_fault_addr, sigill_pt_after - sigill_pt_before);
 
     /* ---- Test 4: Multi-thread pre-existing & post-patch threads (no pthread hook) ---- */
+    const uint32_t* mt_pc = (const uint32_t*)(uintptr_t)mt_lasx_kernel;
+    int mt_xv_idx = -1;
+    for (int i = 0; i < 64; i++) {
+        if ((mt_pc[i] & 0xfc000000U) == 0x2c000000U) {
+            mt_xv_idx = i;
+            break;
+        }
+    }
+    if (mt_xv_idx < 0) {
+        fprintf(stderr, "[FAIL] Test 4 cannot locate worker LASX load\n");
+        return 1;
+    }
     long lbt_inits_before = read_kmod_stat("stat_lbt_inits");
     pthread_barrier_init(&g_pre_barrier, NULL, NUM_PRE_THREADS);
     pthread_barrier_init(&g_post_patch_barrier, NULL, NUM_PRE_THREADS);
@@ -383,6 +396,10 @@ static int run_core_checks(int is_clean_env_child)
         pthread_join(post_th[t], NULL);
 
     long lbt_inits_after = read_kmod_stat("stat_lbt_inits");
+    if ((mt_pc[mt_xv_idx] & 0xfc0003e0U) != 0x48000300U) {
+        fprintf(stderr, "[FAIL] Test 4 renamed worker bypassed LASX emulation\n");
+        return 1;
+    }
     for (int t = 0; t < NUM_PRE_THREADS; t++) {
         if (!pre_args[t].ok) {
             fprintf(stderr, "[FAIL] Test 4 pre-existing thread %d failed!\n", t);

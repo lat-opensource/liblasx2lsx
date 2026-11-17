@@ -4,7 +4,7 @@
  *
  * Production target: Loongson 3B6000M / 2K3000 (LSX + LBT, no hardware LASX).
  *   - Hardware natively raises EXCCODE_INE -> do_ri on LASX instructions.
- *   - Module intercepts DIE_RI on demand, maps the embedded freestanding
+ *   - Module intercepts user RI traps on demand, maps the embedded freestanding
  *     liblasx2lsx PIE runtime (lasx_rt_blob) and a 64KB per-thread context
  *     (reused across thread exits), and redirects user execution to
  *     lasx_rt_trap_entry without signals, TLS, or pthread hooks.
@@ -22,12 +22,13 @@
 #include <linux/cpuhotplug.h>
 #include <linux/cpumask.h>
 #include <linux/ctype.h>
+#include <linux/delay.h>
 #include <linux/hashtable.h>
 #include <linux/init.h>
+#include <linux/kallsyms.h>
 #if __has_include(<linux/instrumentation.h>)
 #include <linux/instrumentation.h>
 #endif
-#include <linux/kdebug.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
 #include <linux/mm.h>
@@ -38,7 +39,6 @@
 #include <linux/mmu_notifier.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/notifier.h>
 #include <linux/pid.h>
 #include <linux/ptrace.h>
 #include <linux/rcupdate.h>
@@ -53,6 +53,11 @@
 #include <linux/uaccess.h>
 #include <linux/version.h>
 #include <linux/wait.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#include <linux/entry-common.h>
+#include <linux/tracepoint.h>
+#include <trace/events/sched.h>
+#endif
 
 #include <asm/cpu-features.h>
 #include <asm/cpu-info.h>
@@ -266,18 +271,157 @@ static u32 saved_lasx_insns[4];
 static u32 saved_lbt_insns[4];
 static u32 patched_lasx_insns[4];
 static u32 patched_lbt_insns[4];
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
 static u32 saved_ri_insns[4];
 static u32 patched_ri_insns[4];
 static atomic_t active_traps = ATOMIC_INIT(0);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
 static DECLARE_WAIT_QUEUE_HEAD(active_traps_wait);
+#else
+static irqentry_state_t (*kernel_irqentry_enter)(struct pt_regs*);
+static void (*kernel_irqentry_exit)(struct pt_regs*, irqentry_state_t);
+#endif
 
-static void lasx_trap_exit(void)
+/* A modern irqentry exit can terminate the task instead of returning. Keep
+ * stack frames on this short list so sched_process_exit can release them. */
+struct lasx_active_trap {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+    struct lasx_active_trap *next, **prev;
+    struct task_struct* task;
+#endif
+};
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+static struct lasx_active_trap* active_head;
+static atomic_t active_lock = ATOMIC_INIT(0);
+static struct tracepoint* task_exit_tp;
+static void* task_exit_probe;
+
+/* These operations also run outside context tracking. Avoid lockdep, tracing,
+ * and debug-list helpers there; the lock only protects pointer updates. */
+static __always_inline unsigned long lasx_active_lock(void)
 {
-    if (atomic_dec_and_test(&active_traps))
-        wake_up(&active_traps_wait);
+    unsigned long flags;
+    raw_local_irq_save(flags);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+    while (raw_atomic_cmpxchg_acquire(&active_lock, 0, 1))
+#else
+    while (atomic_cmpxchg_acquire(&active_lock, 0, 1))
+#endif
+        cpu_relax();
+    return flags;
+}
+
+static __always_inline void lasx_active_unlock(unsigned long flags)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+    raw_atomic_set_release(&active_lock, 0);
+#else
+    atomic_set_release(&active_lock, 0);
+#endif
+    raw_local_irq_restore(flags);
+}
+
+static __always_inline void lasx_untrack_trap(struct lasx_active_trap* trap)
+{
+    *trap->prev = trap->next;
+    if (trap->next)
+        trap->next->prev = trap->prev;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+    raw_atomic_dec(&active_traps);
+#else
+    atomic_dec(&active_traps);
+#endif
+}
+
+static void lasx_task_exit(void* unused, struct task_struct* task)
+{
+    struct lasx_active_trap *trap, *next;
+    unsigned long flags = lasx_active_lock();
+    (void)unused;
+    for (trap = active_head; trap; trap = next) {
+        next = trap->next;
+        if (trap->task == task)
+            lasx_untrack_trap(trap);
+    }
+    lasx_active_unlock(flags);
+}
+
+static void lasx_task_exit_group(void* unused, struct task_struct* task, bool group_dead)
+{
+    (void)group_dead;
+    lasx_task_exit(unused, task);
+}
+
+#ifdef CONFIG_TRACEPOINTS
+static void find_task_exit_tp(struct tracepoint* tp, void* unused)
+{
+    (void)unused;
+    if (!strcmp(tp->name, "sched_process_exit"))
+        task_exit_tp = tp;
 }
 #endif
+
+static int register_task_exit(void)
+{
+#ifdef CONFIG_TRACEPOINTS
+    /* Select the exact prototype from these headers, including vendor kernels. */
+    if (__same_type(&register_trace_sched_process_exit, int (*)(void (*)(void*, struct task_struct*, bool), void*)))
+        task_exit_probe = lasx_task_exit_group;
+    else if (__same_type(&register_trace_sched_process_exit, int (*)(void (*)(void*, struct task_struct*), void*)))
+        task_exit_probe = lasx_task_exit;
+    else
+        return -EOPNOTSUPP;
+    for_each_kernel_tracepoint(find_task_exit_tp, NULL);
+    if (task_exit_tp)
+        return tracepoint_probe_register(task_exit_tp, task_exit_probe, NULL);
+#endif
+    pr_err("lasx2lsx: sched_process_exit tracepoint is required on this kernel\n");
+    return -EOPNOTSUPP;
+}
+
+static void unregister_task_exit(void)
+{
+#ifdef CONFIG_TRACEPOINTS
+    tracepoint_probe_unregister(task_exit_tp, task_exit_probe, NULL);
+    tracepoint_synchronize_unregister();
+#endif
+}
+#endif
+
+static void noinstr lasx_trap_exit(struct lasx_active_trap* trap)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+    unsigned long flags = lasx_active_lock();
+    lasx_untrack_trap(trap);
+    lasx_active_unlock(flags);
+#else
+    (void)trap;
+    if (atomic_dec_and_test(&active_traps))
+        wake_up(&active_traps_wait);
+#endif
+}
+
+static __always_inline void lasx_trap_enter(struct lasx_active_trap* trap)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+    unsigned long flags = lasx_active_lock();
+    trap->task = current;
+    trap->next = active_head;
+    trap->prev = &active_head;
+    if (active_head)
+        active_head->prev = &trap->next;
+    active_head = trap;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+    raw_atomic_inc(&active_traps);
+#else
+    atomic_inc(&active_traps);
+#endif
+    lasx_active_unlock(flags);
+#else
+    (void)trap;
+    atomic_inc(&active_traps);
+#endif
+}
 
 /* LoongArch exception vector slot layout (CSR_EENTRY + exccode * 0x200):
  *   +0x114: 0x00150064 (move $a0, $sp)
@@ -359,6 +503,86 @@ static int decode_and_verify_vec_target(unsigned long eentry, int exccode, unsig
     return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+static int read_kernel_insn(unsigned long pc, u32* insn)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+    return copy_from_kernel_nofault(insn, (void*)pc, sizeof(*insn));
+#else
+    return probe_kernel_read(insn, (void*)pc, sizeof(*insn));
+#endif
+}
+
+static unsigned long branch_target(unsigned long pc, u32 insn)
+{
+    u32 off = ((insn & 0x3ffU) << 16) | ((insn >> 10) & 0xffffU);
+    return pc + sign_extend64(off, 25) * 4;
+}
+
+/* Reuse the exact entry/exit functions called by the installed kernel, without
+ * requiring private symbol exports or KPROBES. Reject unknown compiler layouts.
+ * The first BL follows the stack prologue; the exit is a tail B immediately
+ * after restoring the same stack frame. Cross-check all hooked handlers. */
+static int decode_irqentry(unsigned long fn, unsigned long* enter, unsigned long* exit)
+{
+    u32 insn, prev;
+    int frame, i;
+
+    if (read_kernel_insn(fn, &insn) || (insn & 0xffc003ffU) != 0x02c00063U)
+        return -EINVAL;
+    frame = -sign_extend32((insn >> 10) & 0xfffU, 11);
+    if (frame <= 0 || (frame & 15))
+        return -EINVAL;
+    *enter = *exit = 0;
+    for (i = 1; i < 32; i++) {
+        if (read_kernel_insn(fn + i * 4, &insn))
+            return -EFAULT;
+        if ((insn & 0xfc000000U) == 0x54000000U) {
+            *enter = branch_target(fn + i * 4, insn);
+            break;
+        }
+    }
+    prev = 0;
+    for (i = 1; i < 512; i++) {
+        if (read_kernel_insn(fn + i * 4, &insn))
+            return -EFAULT;
+        if ((prev & 0xffc003ffU) == 0x02c00063U && sign_extend32((prev >> 10) & 0xfffU, 11) == frame && (insn & 0xfc000000U) == 0x50000000U) {
+            *exit = branch_target(fn + i * 4, insn);
+            break;
+        }
+        prev = insn;
+    }
+    if (!*enter || !*exit || *enter == *exit)
+        return -EINVAL;
+#ifdef CONFIG_KALLSYMS
+    {
+        char symbol[KSYM_SYMBOL_LEN];
+        sprint_symbol(symbol, *enter);
+        if (strncmp(symbol, "irqentry_enter+0x0/", strlen("irqentry_enter+0x0/")))
+            return -EINVAL;
+        sprint_symbol(symbol, *exit);
+        if (strncmp(symbol, "irqentry_exit+0x0/", strlen("irqentry_exit+0x0/")))
+            return -EINVAL;
+    }
+#endif
+    return 0;
+}
+
+static int init_irqentry(unsigned long ri, unsigned long lbt, unsigned long lasx)
+{
+    unsigned long enter, exit, other_enter, other_exit;
+
+    if (decode_irqentry(ri, &enter, &exit) || decode_irqentry(lbt, &other_enter, &other_exit) || enter != other_enter || exit != other_exit ||
+        (g_patch_lasxdis && (decode_irqentry(lasx, &other_enter, &other_exit) || enter != other_enter || exit != other_exit))) {
+        pr_err("lasx2lsx: unsupported irqentry call layout\n");
+        return -EINVAL;
+    }
+    kernel_irqentry_enter = (void*)enter;
+    kernel_irqentry_exit = (void*)exit;
+    return 0;
+}
+#endif
+
 /* Read sanitized ASCII CPU model name from IOCSR 0x20 if available */
 static void read_iocsr_cpu_model(char out[16])
 {
@@ -433,11 +657,12 @@ static int lasx_check_platform(char model_out[16])
 /* Lockless, noinstr-safe process filter:
  *   - On 3B6000M / 2K3000 (!g_patch_lasxdis): empty target_comm matches ALL user tasks.
  *   - On 3A6000 verification (g_patch_lasxdis): empty/"*" target_comm is always rejected.
+ *     Match the process leader so renamed audio/codec threads stay in simulation.
  */
 static __always_inline bool should_intercept_current(void)
 {
     const char* p = target_comm;
-    const char* c = current->comm;
+    const char* c = g_patch_lasxdis ? current->group_leader->comm : current->comm;
     char first = READ_ONCE(p[0]);
     int i;
 
@@ -466,25 +691,6 @@ static struct lasx_mm_ctx* lookup_mm_ctx_rcu(struct mm_struct* mm)
     hash_for_each_possible_rcu(lasx_mm_hash, mctx, hnode, (unsigned long)mm)
     {
         if (mctx->mm == mm)
-            return mctx;
-    }
-    return NULL;
-}
-
-/* Lockless lookup when hard IRQs are already disabled (acts as RCU read-side
- * critical section without calling traceable __rcu_read_lock in noinstr).
- */
-static __always_inline struct lasx_mm_ctx* lookup_mm_ctx_irqoff(struct mm_struct* mm)
-{
-    struct hlist_head* head;
-    struct hlist_node* pos;
-
-    if (!mm)
-        return NULL;
-    head = &lasx_mm_hash[hash_min((unsigned long)mm, HASH_BITS(lasx_mm_hash))];
-    for (pos = READ_ONCE(head->first); pos; pos = READ_ONCE(pos->next)) {
-        struct lasx_mm_ctx* mctx = hlist_entry(pos, struct lasx_mm_ctx, hnode);
-        if (READ_ONCE(mctx->mm) == mm)
             return mctx;
     }
     return NULL;
@@ -615,7 +821,7 @@ static unsigned long find_inherited_rt_base(struct mm_struct* mm)
 /* Map embedded lasx_rt_blob into current->mm on first LASX trap, or adopt
  * an existing lasx_rt mapping inherited across fork().
  */
-static struct lasx_mm_ctx* get_or_create_mm_ctx(void)
+static struct lasx_mm_ctx* get_or_create_mm_ctx(bool allow_inject)
 {
     struct mm_struct* mm = current->mm;
     struct lasx_mm_ctx* mctx;
@@ -646,6 +852,11 @@ static struct lasx_mm_ctx* get_or_create_mm_ctx(void)
     rt_base = find_inherited_rt_base(mm);
     if (rt_base != 0)
         adopted = true;
+
+    if (!adopted && !allow_inject) {
+        mutex_unlock(&lasx_inject_mutex);
+        return ERR_PTR(-ENOENT);
+    }
 
     if (!adopted) {
         /* 1. Map [0, LASX_RT_TOTAL_SIZE) as R-X (preferring LASX_RT_HINT_VA) */
@@ -893,230 +1104,168 @@ static int redirect_to_lasx_rt(struct pt_regs* regs, struct lasx_mm_ctx* mctx, u
     return 0;
 }
 
-/*
- * DIE_RI notifier callback — runs in sleepable user trap context with IRQs on.
- *   - trapnr == EXCCODE_INE     (13): native 3B6000M/2K3000 LASX trap, W^X
- *     hypercall, or genuine user illegal instruction.
- *   - trapnr == EXCCODE_BTDIS   (20): routed from my_do_lbt on first LBT use.
- *   - trapnr == EXCCODE_LASXDIS (17): routed from my_do_lasx when sim_3a6000=1.
- */
-static int lasx_die_handler(struct notifier_block* nb, unsigned long val, void* data)
+enum lasx_trap_result {
+    LASX_TRAP_HANDLED,
+    LASX_TRAP_NATIVE,
+    LASX_TRAP_RI,
+};
+
+/* Called with IRQs enabled, outside the atomic die-notifier chain. */
+static enum lasx_trap_result lasx_handle_trap(struct pt_regs* regs, int trapnr)
 {
-    struct die_args* args = data;
-    struct pt_regs* regs;
-    u32 insn = 0;
     struct lasx_mm_ctx* mctx;
     unsigned long tctx_uaddr;
-    u32 in_rt = LASX_IN_RT_NONE;
+    u32 insn, in_rt = LASX_IN_RT_NONE;
+    bool named = should_intercept_current();
+    bool enabled = READ_ONCE(enable_runtime);
 
-    (void)nb;
-    if (val != DIE_RI || !args || !args->regs)
-        return NOTIFY_DONE;
+    if (irqs_disabled())
+        return LASX_TRAP_RI;
+    current->thread.trap_nr = trapnr;
+    if (get_user(insn, (u32 __user*)regs->csr_era))
+        return LASX_TRAP_RI;
 
-    regs = args->regs;
-    if (!user_mode(regs))
-        return NOTIFY_DONE;
+    /* Native LBT instructions, including runtime register binding, need the
+     * original hardware handler. Only external jiscr1 sites need a context. */
+    if (trapnr == EXCCODE_BTDIS && !is_jiscr1_insn(insn))
+        return LASX_TRAP_NATIVE;
 
-    /* 1. Handle W^X COW text-patching hypercall (insn == 0x0, $a7 == MAGIC) */
-    if (args->trapnr == EXCCODE_INE && regs->regs[11] == LASX_HCALL_MAGIC) {
-        if (get_user(insn, (u32 __user*)regs->csr_era) == 0 && insn == LASX_HCALL_INSN && should_intercept_current()) {
-            unsigned long target_pc = regs->regs[4];
-            u32 new_insn = (u32)regs->regs[5];
-            int written = -EFAULT;
+    rcu_read_lock();
+    mctx = lookup_mm_ctx_rcu(current->mm);
+    rcu_read_unlock();
 
-            if ((target_pc & 3UL) == 0 && target_pc < TASK_SIZE) {
-                written = access_process_vm(current, target_pc, &new_insn, sizeof(new_insn), FOLL_FORCE | FOLL_WRITE);
-            }
-            regs->regs[4] = (written == sizeof(new_insn)) ? 0UL : (unsigned long)-EFAULT;
-            regs->csr_era += 4;
-            if (written == sizeof(new_insn))
-                atomic_long_inc(&cnt_hcall_patches);
-            return NOTIFY_STOP;
+    if (!mctx && !named) {
+        mctx = get_or_create_mm_ctx(false);
+        if (IS_ERR(mctx)) {
+            if (PTR_ERR(mctx) == -ENOENT)
+                return trapnr == EXCCODE_INE ? LASX_TRAP_RI : LASX_TRAP_NATIVE;
+            return LASX_TRAP_RI;
         }
     }
 
-    /* 2. First-use LBT trap routed from my_do_lbt (trapnr == EXCCODE_BTDIS) */
-    if (args->trapnr == EXCCODE_BTDIS) {
-        if (get_user(insn, (u32 __user*)regs->csr_era) == 0 && is_jiscr1_insn(insn)) {
-            rcu_read_lock();
-            mctx = lookup_mm_ctx_rcu(current->mm);
-            rcu_read_unlock();
-            if (!mctx && should_intercept_current() && READ_ONCE(enable_runtime))
-                mctx = get_or_create_mm_ctx();
+    if (trapnr == EXCCODE_INE && regs->regs[11] == LASX_HCALL_MAGIC && insn == LASX_HCALL_INSN) {
+        unsigned long target_pc = regs->regs[4];
+        u32 new_insn = (u32)regs->regs[5];
+        int written = -EFAULT;
 
-            if (!IS_ERR_OR_NULL(mctx) && !(regs->csr_era >= mctx->rt_base && regs->csr_era < mctx->rt_base + LASX_RT_TOTAL_SIZE)) {
-                tctx_uaddr = get_or_create_tctx(mctx);
-                if (!IS_ERR_VALUE(tctx_uaddr) && redirect_to_lasx_rt(regs, mctx, tctx_uaddr, LASX_TRAP_LBT_INIT) == 0) {
-                    atomic_long_inc(&cnt_lbt_inits);
-                    return NOTIFY_STOP;
-                }
-            }
-        }
-        return NOTIFY_STOP;
+        if ((target_pc & 3UL) == 0 && target_pc < TASK_SIZE)
+            written = access_process_vm(current, target_pc, &new_insn, sizeof(new_insn), FOLL_FORCE | FOLL_WRITE);
+        regs->regs[4] = written == sizeof(new_insn) ? 0UL : (unsigned long)-EFAULT;
+        regs->csr_era += 4;
+        if (written == sizeof(new_insn))
+            atomic_long_inc(&cnt_hcall_patches);
+        return LASX_TRAP_HANDLED;
     }
 
-    /* 3. LASX reserved-instruction trap */
-    if (!should_intercept_current())
-        return NOTIFY_DONE;
-
-    if (!READ_ONCE(enable_runtime)) {
-        if (!g_patch_lasxdis && get_user(insn, (u32 __user*)regs->csr_era) == 0 && is_lasx_insn(insn)) {
+    if (trapnr == EXCCODE_LASXDIS)
+        atomic_long_inc(&cnt_lasx_intercepted);
+    /* Existing jiscr1 patches still need SCR bindings after injection stops. */
+    if (!enabled && trapnr != EXCCODE_BTDIS) {
+        if (trapnr == EXCCODE_INE && is_lasx_insn(insn))
             atomic_long_inc(&cnt_lasx_intercepted);
-        }
-        return NOTIFY_DONE;
+        return LASX_TRAP_RI;
     }
-
-    if (get_user(insn, (u32 __user*)regs->csr_era) != 0)
-        return NOTIFY_DONE;
-
-    /* Another thread may have concurrently patched *pc to jiscr1 */
     if (!is_lasx_insn(insn) && !is_jiscr1_insn(insn)) {
         atomic_long_inc(&cnt_sigill_passthrough);
-        return NOTIFY_DONE;
+        return LASX_TRAP_RI;
     }
-
-    if (!g_patch_lasxdis)
+    if (trapnr == EXCCODE_INE && is_lasx_insn(insn))
         atomic_long_inc(&cnt_lasx_intercepted);
 
-    mctx = get_or_create_mm_ctx();
+    if (!mctx)
+        mctx = get_or_create_mm_ctx(trapnr != EXCCODE_BTDIS && named);
     if (IS_ERR(mctx))
-        return NOTIFY_DONE;
+        return trapnr == EXCCODE_BTDIS && PTR_ERR(mctx) == -ENOENT ? LASX_TRAP_NATIVE : LASX_TRAP_RI;
 
-    /* Never recursively trap inside lasx_rt itself */
     if (regs->csr_era >= mctx->rt_base && regs->csr_era < mctx->rt_base + LASX_RT_TOTAL_SIZE)
-        return NOTIFY_DONE;
+        return trapnr == EXCCODE_BTDIS ? LASX_TRAP_NATIVE : LASX_TRAP_RI;
 
     tctx_uaddr = get_or_create_tctx(mctx);
     if (IS_ERR_VALUE(tctx_uaddr))
-        return NOTIFY_DONE;
+        return LASX_TRAP_RI;
 
-    if (get_user(in_rt, &((struct lasx_trap_frame __user*)tctx_uaddr)->in_rt) == 0) {
+    if (trapnr != EXCCODE_BTDIS && get_user(in_rt, &((struct lasx_trap_frame __user*)tctx_uaddr)->in_rt) == 0) {
         if (in_rt == LASX_IN_RT_PASSTHRU) {
             put_user((u32)LASX_IN_RT_NONE, &((struct lasx_trap_frame __user*)tctx_uaddr)->in_rt);
             atomic_long_inc(&cnt_sigill_passthrough);
-            return NOTIFY_DONE;
+            return LASX_TRAP_RI;
         }
         if (in_rt == LASX_IN_RT_ACTIVE)
-            return NOTIFY_DONE;
+            return LASX_TRAP_RI;
     }
 
-    if (redirect_to_lasx_rt(regs, mctx, tctx_uaddr, LASX_TRAP_LASX_INSN) != 0)
-        return NOTIFY_DONE;
-
-    atomic_long_inc(&cnt_rt_upcalls);
-    return NOTIFY_STOP;
+    if (redirect_to_lasx_rt(regs, mctx, tctx_uaddr, trapnr == EXCCODE_BTDIS ? LASX_TRAP_LBT_INIT : LASX_TRAP_LASX_INSN))
+        return LASX_TRAP_RI;
+    atomic_long_inc(trapnr == EXCCODE_BTDIS ? &cnt_lbt_inits : &cnt_rt_upcalls);
+    return LASX_TRAP_HANDLED;
 }
 
+/* Modern vector stubs enter with IRQs off and context tracking still in user
+ * mode. Establish the same boundary as the original C handlers before sleeping.
+ * On 4.19 the vector stub has already established the sleepable context. */
+static __always_inline enum lasx_trap_result lasx_user_trap(struct pt_regs* regs, int trapnr)
+{
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-static struct notifier_block lasx_die_nb = {
-    .notifier_call = lasx_die_handler,
-    .priority = 100,
-};
+    irqentry_state_t state = kernel_irqentry_enter(regs);
+    enum lasx_trap_result result;
+    unsigned long resume_pc;
+
+    instrumentation_begin();
+    local_irq_enable();
+    result = lasx_handle_trap(regs, trapnr);
+    resume_pc = regs->csr_era;
+    local_irq_disable();
+    instrumentation_end();
+    kernel_irqentry_exit(regs, state);
+
+    /* Exit may have delivered a pending signal. Do not pass that signal
+     * handler's PC to the original handler for the old exception. Sigreturn
+     * will retry the original instruction if it still needs native handling. */
+    if (regs->csr_era != resume_pc)
+        return LASX_TRAP_HANDLED;
+    return result;
+#else
+    return lasx_handle_trap(regs, trapnr);
 #endif
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-/* The 4.19 die chain is atomic; call the sleepable handler before entering it. */
-static int lasx_handle_trap(struct pt_regs* regs, int trapnr)
-{
-    struct die_args args = { .regs = regs, .trapnr = trapnr };
-
-    if (!user_mode(regs) || irqs_disabled())
-        return NOTIFY_DONE;
-    return lasx_die_handler(NULL, DIE_RI, &args);
 }
 
-static asmlinkage void my_do_ri(struct pt_regs* regs)
+static asmlinkage void noinstr my_do_ri(struct pt_regs* regs)
 {
-    atomic_inc(&active_traps);
-    if (lasx_handle_trap(regs, EXCCODE_INE) != NOTIFY_STOP)
+    struct lasx_active_trap active;
+    lasx_trap_enter(&active);
+    if (!user_mode(regs) || lasx_user_trap(regs, EXCCODE_INE) != LASX_TRAP_HANDLED)
         orig_do_ri(regs);
-    lasx_trap_exit();
+    lasx_trap_exit(&active);
 }
-#endif
 
-/*
- * Intercepted EXCCODE_LASXDIS (17) handler — ONLY installed when sim_3a6000=1.
- * Keeps CSR.EUEN.LASXEN == 0 for target_comm processes and delegates to
- * orig_do_ri(regs) to reproduce 3B6000M / 2K3000 EXCCODE_INE behavior.
- */
 static asmlinkage void noinstr my_do_lasx(struct pt_regs* regs)
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    atomic_inc(&active_traps);
-#endif
-    if (!user_mode(regs) || !should_intercept_current()) {
+    enum lasx_trap_result result;
+
+    struct lasx_active_trap active;
+    lasx_trap_enter(&active);
+    result = user_mode(regs) ? lasx_user_trap(regs, EXCCODE_LASXDIS) : LASX_TRAP_NATIVE;
+    if (result == LASX_TRAP_NATIVE) {
         lasx_noinstr_atomic_inc(&cnt_lasx_passthrough);
         orig_do_lasx(regs);
-        goto out;
-    }
-
-    lasx_noinstr_atomic_inc(&cnt_lasx_intercepted);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    if (lasx_handle_trap(regs, EXCCODE_LASXDIS) != NOTIFY_STOP)
+    } else if (result == LASX_TRAP_RI) {
         orig_do_ri(regs);
-#else
-    orig_do_ri(regs);
-#endif
-out:
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    lasx_trap_exit();
-#endif
-    return;
+    }
+    lasx_trap_exit(&active);
 }
 
-/*
- * Intercepted EXCCODE_BTDIS (20) handler — enables hardware LBT via
- * orig_do_lbt(regs), and on a thread's very first LBT use outside lasx_rt
- * enters lasx_die_handler via orig_do_ri(regs) to lazily bind $scr1/$scr2.
- */
 static asmlinkage void noinstr my_do_lbt(struct pt_regs* regs)
 {
-    bool was_used_lbt = test_ti_thread_flag(task_thread_info(current), TIF_USEDLBT);
-    struct lasx_mm_ctx* mctx;
+    enum lasx_trap_result result;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    atomic_inc(&active_traps);
-#endif
-    orig_do_lbt(regs);
-
-    if (was_used_lbt || !user_mode(regs))
-        goto out;
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    rcu_read_lock();
-    mctx = lookup_mm_ctx_rcu(current->mm);
-#else
-    mctx = lookup_mm_ctx_irqoff(current->mm);
-#endif
-    if (mctx) {
-        bool outside_rt = !(regs->csr_era >= mctx->rt_base && regs->csr_era < mctx->rt_base + LASX_RT_TOTAL_SIZE);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-        rcu_read_unlock();
-        if (outside_rt)
-            lasx_handle_trap(regs, EXCCODE_BTDIS);
-#else
-        if (outside_rt) {
-            orig_do_ri(regs);
-        }
-#endif
-    } else if (should_intercept_current() && READ_ONCE(enable_runtime)) {
-        /* Handle fork()ed child whose mm inherited jiscr1 sites from parent */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-        rcu_read_unlock();
-        lasx_handle_trap(regs, EXCCODE_BTDIS);
-#else
+    struct lasx_active_trap active;
+    lasx_trap_enter(&active);
+    result = user_mode(regs) ? lasx_user_trap(regs, EXCCODE_BTDIS) : LASX_TRAP_NATIVE;
+    if (result == LASX_TRAP_NATIVE)
+        orig_do_lbt(regs);
+    else if (result == LASX_TRAP_RI)
         orig_do_ri(regs);
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    } else {
-        rcu_read_unlock();
-#endif
-    }
-out:
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    lasx_trap_exit();
-#endif
-    return;
+    lasx_trap_exit(&active);
 }
 
 struct cpu_verify_ctx {
@@ -1149,9 +1298,7 @@ struct sm_patch_req {
     bool patch_lasx;
     u32 lasx_insns[4];
     u32 lbt_insns[4];
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     u32 ri_insns[4];
-#endif
 };
 
 static void write_local_eentry_vectors(const struct sm_patch_req* req)
@@ -1160,11 +1307,9 @@ static void write_local_eentry_vectors(const struct sm_patch_req* req)
     u32* vec_lbt = (u32*)(eentry + (unsigned long)EXCCODE_BTDIS * VEC_SLOT_STRIDE);
     int i;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     u32* vec_ri = (u32*)(eentry + (unsigned long)EXCCODE_INE * VEC_SLOT_STRIDE);
     for (i = 0; i < 4; i++)
         WRITE_ONCE(vec_ri[vec_move_idx(EXCCODE_INE) + 1 + i], req->ri_insns[i]);
-#endif
     for (i = 0; i < 4; i++)
         WRITE_ONCE(vec_lbt[vec_move_idx(EXCCODE_BTDIS) + 1 + i], req->lbt_insns[i]);
 
@@ -1183,14 +1328,16 @@ static int apply_vector_patch_sm(void* arg)
     return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+static void lasx_sync_trap_returns(void* unused) { (void)unused; }
+#endif
+
 /* Re-apply per-CPU CSR_EENTRY patch when a CPU comes online (suspend/resume or hotplug) */
 static int lasx_cpu_online(unsigned int cpu)
 {
     unsigned long eentry = csr_read64(LOONGARCH_CSR_EENTRY);
     unsigned long fn_lbt = 0, fn_lasx = 0;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     unsigned long fn_ri = 0;
-#endif
     unsigned long flags;
     struct sm_patch_req req;
 
@@ -1198,11 +1345,9 @@ static int lasx_cpu_online(unsigned int cpu)
     if (!eentry)
         return 0;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     if (decode_and_verify_vec_target(eentry, EXCCODE_INE, &fn_ri, NULL) != 0 ||
         (fn_ri != (unsigned long)orig_do_ri && fn_ri != (unsigned long)my_do_ri))
         return 0;
-#endif
     if (decode_and_verify_vec_target(eentry, EXCCODE_BTDIS, &fn_lbt, NULL) != 0)
         return 0;
     if (fn_lbt == (unsigned long)my_do_lbt && (!g_patch_lasxdis))
@@ -1213,9 +1358,7 @@ static int lasx_cpu_online(unsigned int cpu)
     req.patch_lasx = g_patch_lasxdis;
     memcpy(req.lasx_insns, patched_lasx_insns, sizeof(patched_lasx_insns));
     memcpy(req.lbt_insns, patched_lbt_insns, sizeof(patched_lbt_insns));
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     memcpy(req.ri_insns, patched_ri_insns, sizeof(patched_ri_insns));
-#endif
 
     local_irq_save(flags);
     write_local_eentry_vectors(&req);
@@ -1246,13 +1389,7 @@ static int __init lasx2lsx_kmod_init(void)
         return -EINVAL;
     }
 
-    ret = decode_and_verify_vec_target(local_eentry, EXCCODE_INE, &fn_ri,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-                                       saved_ri_insns
-#else
-                                       NULL
-#endif
-    );
+    ret = decode_and_verify_vec_target(local_eentry, EXCCODE_INE, &fn_ri, saved_ri_insns);
     if (ret)
         return ret;
     ret = decode_and_verify_vec_target(local_eentry, EXCCODE_BTDIS, &fn_lbt, saved_lbt_insns);
@@ -1279,14 +1416,14 @@ static int __init lasx2lsx_kmod_init(void)
     orig_do_lbt = (loongarch_exc_fn_t)fn_lbt;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-    ret = register_die_notifier(&lasx_die_nb);
-    if (ret) {
-        pr_err("lasx2lsx: register_die_notifier failed: %d\n", ret);
+    ret = init_irqentry(fn_ri, fn_lbt, fn_lasx);
+    if (ret)
         return ret;
-    }
-#else
-    encode_t0_imm64((unsigned long)my_do_ri, patched_ri_insns);
+    ret = register_task_exit();
+    if (ret)
+        return ret;
 #endif
+    encode_t0_imm64((unsigned long)my_do_ri, patched_ri_insns);
 
     encode_t0_imm64((unsigned long)my_do_lasx, patched_lasx_insns);
     encode_t0_imm64((unsigned long)my_do_lbt, patched_lbt_insns);
@@ -1294,16 +1431,14 @@ static int __init lasx2lsx_kmod_init(void)
     req.patch_lasx = g_patch_lasxdis;
     memcpy(req.lasx_insns, patched_lasx_insns, sizeof(patched_lasx_insns));
     memcpy(req.lbt_insns, patched_lbt_insns, sizeof(patched_lbt_insns));
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     memcpy(req.ri_insns, patched_ri_insns, sizeof(patched_ri_insns));
-#endif
 
     ret = stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
     if (ret) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-        unregister_die_notifier(&lasx_die_nb);
-#endif
         pr_err("lasx2lsx: stop_machine vector patch failed: %d\n", ret);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+        unregister_task_exit();
+#endif
         return ret;
     }
 
@@ -1333,9 +1468,7 @@ static void __exit lasx2lsx_kmod_exit(void)
     req.patch_lasx = g_patch_lasxdis;
     memcpy(req.lasx_insns, saved_lasx_insns, sizeof(saved_lasx_insns));
     memcpy(req.lbt_insns, saved_lbt_insns, sizeof(saved_lbt_insns));
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
     memcpy(req.ri_insns, saved_ri_insns, sizeof(saved_ri_insns));
-#endif
 
     stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
 
@@ -1345,7 +1478,14 @@ static void __exit lasx2lsx_kmod_exit(void)
     synchronize_sched();
 #endif
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-    unregister_die_notifier(&lasx_die_nb);
+    /* Wrappers leave with IRQs off, so no new entry can slip past the counter
+     * after stop_machine restores the vectors. Their cores may have slept. */
+    while (atomic_read(&active_traps))
+        msleep(1);
+    unregister_task_exit();
+    /* A CPU may still be executing the IRQ-off epilogue after decrementing.
+     * A synchronous IPI cannot run there until it has left the wrapper. */
+    on_each_cpu(lasx_sync_trap_returns, NULL, 1);
 #endif
 
     /* Unregister mmu_notifiers for any still-running processes */

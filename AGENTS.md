@@ -1069,6 +1069,9 @@ kmod/
 
 - **生产模式（默认 `sim_3a6000=0`）**：模块初始化时严格校验处理器型号，**仅在龙芯 3B6000M / 2K3000（LA364 系列，支持 LSX + LBT 且硬件无 LASX）上允许加载**；在 3A6000 等原生支持 LASX 的平台上默认返回 `-ENODEV` 拒绝初始化，避免误伤原生性能。
 - **3A6000 验证模式（仅测试用途）**：需显式传入 `sim_3a6000=1 target_comm=<进程名前缀>`（禁止空前缀或 `*`），额外拦截 `EXCCODE_LASXDIS`（`do_lasx`）以模拟 3B6000M / 2K3000 的保留指令例外。
+- 验证模式的 `target_comm` 按线程组主线程名称匹配，避免腾讯会议等程序把工作线程改名后绕过模拟。测试时除核对计算结果，还需检查工作线程代码已改写为 `jiscr1`；3A6000 原生支持 LASX，漏拦截也可能算出正确结果。
+- 改名线程 `fork()` 后，子进程名称可能不匹配过滤条件，但仍继承父进程的 `jiscr1`。此时只能恢复实际继承的运行时，不能给无继承映射的非目标进程首次注入；已有运行时的进程继续模拟新 LASX 和处理补丁调用，直到 `exec` 更换内存空间。`test_lasx_fork` 覆盖继承 JIT 先执行、新 LASX 先执行、真实 SIGILL 及 exec 后原生执行；多线程 TLS 清理中的 memset 曾触发与腾讯会议一致的故障。
+- 新旧内核均在原子异常通知链之外处理运行时映射。4.19 使用汇编入口已建立的上下文；新版校验原 handler 的入口/出口调用并使用相同的 irqentry 函数。新版退出处理可能先交付待发信号并改变 PC，此时不能把新 PC 交给原 handler 处理旧异常。新版要求 `CONFIG_TRACEPOINTS`，用 `sched_process_exit` 删除因致命信号退出而不再返回的活动栈帧；正常返回删除自身节点，节点锁须在上下文跟踪之外保持不可插桩。卸载须等待活动入口归零、注销并同步退出回调，再等待减计数后的 IRQ-off 返回代码完成。
 
 ### 构建与验证命令
 
@@ -1086,4 +1089,5 @@ sudo modprobe lasx2lsx sim_3a6000=1 target_comm=test_lasx
 env -i ./kmod/tests/test_lasx_raw_ri
 env -i ./kmod/tests/test_lasx_suite
 env -i ./kmod/tests/test_lasx_static
+env -i ./kmod/tests/test_lasx_fork
 ```
