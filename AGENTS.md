@@ -1091,3 +1091,11 @@ env -i ./kmod/tests/test_lasx_suite
 env -i ./kmod/tests/test_lasx_static
 env -i ./kmod/tests/test_lasx_fork
 ```
+
+### 固定硬件异常入口接管（2026-11-17）
+
+- 不按编译器生成的 `move a0, sp` 或 C 调用序列寻找替换点。UOS 4.19 的异常现场保存长度与 Loongnix 不同，固定 C 调用偏移会拒绝加载。
+- 用 `EENTRY + exccode * (1 << (ECFG.VS + 2))` 定位分立入口；VS=0 或槽小于28字节时拒绝。仅保存/替换槽首7条，KS0/KS1先备份t0/t1，再绝对跳转到自有汇编。其余原入口代码保留，兼容已在原 C handler 中等待的任务返回。
+- `lasx_entry.S` 用安装内核的生成偏移构造 `pt_regs`，经按名称查找的 `kernelsp` 切换用户/内核栈（要求 `CONFIG_KALLSYMS_ALL`）。4.19返回 `ret_from_exception`；新版调用 `irqentry_enter/exit` 后自行恢复现场并 `ertn`。
+- 活动计数递减到汇编返回之间必须关中断；恢复原向量、等待活动计数归零后，再用同步IPI等待汇编尾部退出。测试 `test_lasx_regs` 覆盖全部非零GPR经过LASX/LBT首次陷阱的保存恢复，可分别用匹配/不匹配的名称过滤检查翻译与原生回退。
+- 4.19 的 LBT 入口须按 `PRMD.PIE` 保持原中断状态；内核 FP 保存/恢复时可在关中断状态触发 LBT 异常。现代返回仅对用户态恢复 r21，内核态须保留调度更新的 CPU 基址。安装时在发布各 CPU 完成计数前和等待全部完成后均用 `smp_mb()`，不可将 `atomic_inc()` 当作内存屏障。

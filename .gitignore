@@ -95,3 +95,6 @@ kmod/.cache.mk
 kmod/tests/test_lasx_raw_ri
 kmod/tests/test_lasx_suite
 kmod/tests/test_lasx_static
+
+kmod/tests/test_lasx_regs
+!kmod/tests/test_lasx_regs.S

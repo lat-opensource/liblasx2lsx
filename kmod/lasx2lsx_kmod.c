@@ -30,6 +30,7 @@
 #include <linux/instrumentation.h>
 #endif
 #include <linux/kernel.h>
+#include <linux/kprobes.h>
 #include <linux/list.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
@@ -261,22 +262,27 @@ static DEFINE_HASHTABLE(lasx_mm_hash, 8);
 static DEFINE_SPINLOCK(lasx_mm_hash_lock);
 static DEFINE_MUTEX(lasx_inject_mutex);
 
-/* Original kernel exception C handlers decoded from live CSR_EENTRY */
+/* Original C handlers resolved by name, independently of vector code layout. */
 typedef asmlinkage void (*loongarch_exc_fn_t)(struct pt_regs* regs);
 static loongarch_exc_fn_t orig_do_ri;
 static loongarch_exc_fn_t orig_do_lasx;
 static loongarch_exc_fn_t orig_do_lbt;
 
-static u32 saved_lasx_insns[4];
-static u32 saved_lbt_insns[4];
-static u32 patched_lasx_insns[4];
-static u32 patched_lbt_insns[4];
-static u32 saved_ri_insns[4];
-static u32 patched_ri_insns[4];
+#define VEC_ENTRY_WORDS 7
+static u32 saved_lasx_insns[VEC_ENTRY_WORDS];
+static u32 saved_lbt_insns[VEC_ENTRY_WORDS];
+static u32 patched_lasx_insns[VEC_ENTRY_WORDS];
+static u32 patched_lbt_insns[VEC_ENTRY_WORDS];
+static u32 saved_ri_insns[VEC_ENTRY_WORDS];
+static u32 patched_ri_insns[VEC_ENTRY_WORDS];
+static unsigned long vec_stride;
+static bool vectors_live;
+/* Read by the assembly entry; kernelsp is a per-CPU kernel symbol. */
+unsigned long lasx_kernelsp;
+unsigned long lasx_ret_from_exception;
+extern void lasx_entry_ri(void), lasx_entry_lbt(void), lasx_entry_lasx(void);
 static atomic_t active_traps = ATOMIC_INIT(0);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-static DECLARE_WAIT_QUEUE_HEAD(active_traps_wait);
-#else
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 static irqentry_state_t (*kernel_irqentry_enter)(struct pt_regs*);
 static void (*kernel_irqentry_exit)(struct pt_regs*, irqentry_state_t);
 #endif
@@ -396,8 +402,7 @@ static void noinstr lasx_trap_exit(struct lasx_active_trap* trap)
     lasx_active_unlock(flags);
 #else
     (void)trap;
-    if (atomic_dec_and_test(&active_traps))
-        wake_up(&active_traps_wait);
+    atomic_dec(&active_traps);
 #endif
 }
 
@@ -423,165 +428,68 @@ static __always_inline void lasx_trap_enter(struct lasx_active_trap* trap)
 #endif
 }
 
-/* LoongArch exception vector slot layout (CSR_EENTRY + exccode * 0x200):
- *   +0x114: 0x00150064 (move $a0, $sp)
- *   +0x118: lu12i.w $t0, addr[31:12]
- *   +0x11c: ori     $t0, $t0, addr[11:0]
- *   +0x120: lu32i.d $t0, addr[51:32]
- *   +0x124: lu52i.d $t0, $t0, addr[63:52]
- *   +0x128: 0x4c000181 (jirl $ra, $t0, 0)
- */
-#define VEC_SLOT_STRIDE 0x200UL
-#define VEC_MOVE_A0_SP_IDX (0x114 / 4)
-
-#define INSN_MOVE_A0_SP 0x00150064U
-#define INSN_JIRL_RA_T0 0x4c000181U
-
-/* Loongnix 4.19 uses a different prologue for each exception. */
-static unsigned int vec_move_idx(int exccode)
+/* The hardware entry begins with IRQs off. Save t0/t1 before the absolute
+ * jump, then build pt_regs in our own assembly, without decoding kernel code.
+ * Linux does not enable IRQs or return into these first 28 bytes. */
+static void encode_vector_entry(unsigned long addr, u32 out[VEC_ENTRY_WORDS])
 {
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    if (exccode == EXCCODE_INE)
-        return 0x11c / 4;
-    if (exccode == EXCCODE_LASXDIS)
-        return 0xf4 / 4;
-    if (exccode == EXCCODE_BTDIS)
-        return 0x120 / 4;
-#endif
-    return VEC_MOVE_A0_SP_IDX;
+    out[0] = 0x0400c02cU; /* csrwr t0, KS0 (0x30) */
+    out[1] = 0x0400c42dU; /* csrwr t1, KS1 (0x31) */
+    out[2] = 0x1400000cU | (u32)(((addr >> 12) & 0xfffffUL) << 5);
+    out[3] = 0x0380018cU | (u32)((addr & 0xfffUL) << 10);
+    out[4] = 0x1600000cU | (u32)(((addr >> 32) & 0xfffffUL) << 5);
+    out[5] = 0x0300018cU | (u32)(((addr >> 52) & 0xfffUL) << 10);
+    out[6] = 0x4c000180U; /* jirl zero, t0, 0 */
 }
 
-static void encode_t0_imm64(unsigned long addr, u32 out[4])
+static int init_kernel_symbols(void)
 {
-    out[0] = 0x1400000cU | (u32)(((addr >> 12) & 0xfffffUL) << 5);
-    out[1] = 0x0380018cU | (u32)((addr & 0xfffUL) << 10);
-    out[2] = 0x1600000cU | (u32)(((addr >> 32) & 0xfffffUL) << 5);
-    out[3] = 0x0300018cU | (u32)(((addr >> 52) & 0xfffUL) << 10);
-}
-
-static int decode_and_verify_vec_target(unsigned long eentry, int exccode, unsigned long* fn_out, u32 orig_insns[4])
-{
-    const u32* vec = (const u32*)(eentry + (unsigned long)exccode * VEC_SLOT_STRIDE);
-    u32 i0, i1, i2, i3;
-    u32 check[4];
-    unsigned long addr;
-    unsigned int move_idx = vec_move_idx(exccode);
-
-    if ((vec[move_idx] != INSN_MOVE_A0_SP && vec[move_idx] != 0x00410064U) || vec[move_idx + 5] != INSN_JIRL_RA_T0) {
-        pr_err("lasx2lsx: exccode %d prologue/call mismatch (%08x / %08x)\n", exccode, vec[move_idx], vec[move_idx + 5]);
-        return -EINVAL;
+    unsigned long (*lookup)(const char*);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
+#ifdef CONFIG_KPROBES
+    struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
+    int ret = register_kprobe(&kp);
+    if (ret) {
+        pr_err("lasx2lsx: cannot resolve kallsyms_lookup_name: %d\n", ret);
+        return ret;
     }
-
-    i0 = vec[move_idx + 1];
-    i1 = vec[move_idx + 2];
-    i2 = vec[move_idx + 3];
-    i3 = vec[move_idx + 4];
-
-    if ((i0 & 0xfe00001fU) != 0x1400000cU || (i1 & 0xffc003ffU) != 0x0380018cU || (i2 & 0xfe00001fU) != 0x1600000cU || (i3 & 0xffc003ffU) != 0x0300018cU) {
-        pr_err("lasx2lsx: exccode %d t0 imm64 pattern mismatch (%08x %08x %08x %08x)\n", exccode, i0, i1, i2, i3);
-        return -EINVAL;
-    }
-
-    addr = ((unsigned long)((i1 >> 10) & 0xfffU));
-    addr |= ((unsigned long)((i0 >> 5) & 0xfffffU)) << 12;
-    addr |= ((unsigned long)((i2 >> 5) & 0xfffffU)) << 32;
-    addr |= ((unsigned long)((i3 >> 10) & 0xfffU)) << 52;
-
-    encode_t0_imm64(addr, check);
-    if (check[0] != i0 || check[1] != i1 || check[2] != i2 || check[3] != i3) {
-        pr_err("lasx2lsx: exccode %d round-trip encode check failed\n", exccode);
-        return -EINVAL;
-    }
-
-    if (orig_insns) {
-        orig_insns[0] = i0;
-        orig_insns[1] = i1;
-        orig_insns[2] = i2;
-        orig_insns[3] = i3;
-    }
-    *fn_out = addr;
-    return 0;
-}
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-static int read_kernel_insn(unsigned long pc, u32* insn)
-{
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
-    return copy_from_kernel_nofault(insn, (void*)pc, sizeof(*insn));
+    lookup = (void*)kp.addr;
+    unregister_kprobe(&kp);
 #else
-    return probe_kernel_read(insn, (void*)pc, sizeof(*insn));
+    pr_err("lasx2lsx: CONFIG_KPROBES is required to resolve kernel symbols\n");
+    return -EOPNOTSUPP;
 #endif
-}
-
-static unsigned long branch_target(unsigned long pc, u32 insn)
-{
-    u32 off = ((insn & 0x3ffU) << 16) | ((insn >> 10) & 0xffffU);
-    return pc + sign_extend64(off, 25) * 4;
-}
-
-/* Reuse the exact entry/exit functions called by the installed kernel, without
- * requiring private symbol exports or KPROBES. Reject unknown compiler layouts.
- * The first BL follows the stack prologue; the exit is a tail B immediately
- * after restoring the same stack frame. Cross-check all hooked handlers. */
-static int decode_irqentry(unsigned long fn, unsigned long* enter, unsigned long* exit)
-{
-    u32 insn, prev;
-    int frame, i;
-
-    if (read_kernel_insn(fn, &insn) || (insn & 0xffc003ffU) != 0x02c00063U)
-        return -EINVAL;
-    frame = -sign_extend32((insn >> 10) & 0xfffU, 11);
-    if (frame <= 0 || (frame & 15))
-        return -EINVAL;
-    *enter = *exit = 0;
-    for (i = 1; i < 32; i++) {
-        if (read_kernel_insn(fn + i * 4, &insn))
-            return -EFAULT;
-        if ((insn & 0xfc000000U) == 0x54000000U) {
-            *enter = branch_target(fn + i * 4, insn);
-            break;
-        }
-    }
-    prev = 0;
-    for (i = 1; i < 512; i++) {
-        if (read_kernel_insn(fn + i * 4, &insn))
-            return -EFAULT;
-        if ((prev & 0xffc003ffU) == 0x02c00063U && sign_extend32((prev >> 10) & 0xfffU, 11) == frame && (insn & 0xfc000000U) == 0x50000000U) {
-            *exit = branch_target(fn + i * 4, insn);
-            break;
-        }
-        prev = insn;
-    }
-    if (!*enter || !*exit || *enter == *exit)
-        return -EINVAL;
-#ifdef CONFIG_KALLSYMS
-    {
-        char symbol[KSYM_SYMBOL_LEN];
-        sprint_symbol(symbol, *enter);
-        if (strncmp(symbol, "irqentry_enter+0x0/", strlen("irqentry_enter+0x0/")))
-            return -EINVAL;
-        sprint_symbol(symbol, *exit);
-        if (strncmp(symbol, "irqentry_exit+0x0/", strlen("irqentry_exit+0x0/")))
-            return -EINVAL;
-    }
+#else
+    lookup = kallsyms_lookup_name;
 #endif
-    return 0;
-}
-
-static int init_irqentry(unsigned long ri, unsigned long lbt, unsigned long lasx)
-{
-    unsigned long enter, exit, other_enter, other_exit;
-
-    if (decode_irqentry(ri, &enter, &exit) || decode_irqentry(lbt, &other_enter, &other_exit) || enter != other_enter || exit != other_exit ||
-        (g_patch_lasxdis && (decode_irqentry(lasx, &other_enter, &other_exit) || enter != other_enter || exit != other_exit))) {
-        pr_err("lasx2lsx: unsupported irqentry call layout\n");
-        return -EINVAL;
-    }
-    kernel_irqentry_enter = (void*)enter;
-    kernel_irqentry_exit = (void*)exit;
-    return 0;
-}
+    lasx_kernelsp = lookup("kernelsp");
+    orig_do_ri = (void*)lookup("do_ri");
+    orig_do_lbt = (void*)lookup("do_lbt");
+    if (g_patch_lasxdis)
+        orig_do_lasx = (void*)lookup("do_lasx");
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+    kernel_irqentry_enter = (void*)lookup("irqentry_enter");
+    kernel_irqentry_exit = (void*)lookup("irqentry_exit");
+    if (!kernel_irqentry_enter || !kernel_irqentry_exit)
+        goto missing;
+#else
+    lasx_ret_from_exception = lookup("ret_from_exception");
+    if (!lasx_ret_from_exception)
+        goto missing;
 #endif
+    if (lasx_kernelsp && orig_do_ri && orig_do_lbt && (!g_patch_lasxdis || orig_do_lasx))
+        return 0;
+missing:
+    pr_err("lasx2lsx: required kernel exception symbol is unavailable\n");
+    return -EOPNOTSUPP;
+}
+
+static unsigned long local_vec_stride(void)
+{
+    unsigned int vs = (csr_read32(LOONGARCH_CSR_ECFG) >> 16) & 7;
+    /* VS=0 shares a single entry. Each replaced prefix must fit its slot. */
+    return vs ? 1UL << (vs + 2) : 0;
+}
 
 /* Read sanitized ASCII CPU model name from IOCSR 0x20 if available */
 static void read_iocsr_cpu_model(char out[16])
@@ -1202,7 +1110,7 @@ static enum lasx_trap_result lasx_handle_trap(struct pt_regs* regs, int trapnr)
 
 /* Modern vector stubs enter with IRQs off and context tracking still in user
  * mode. Establish the same boundary as the original C handlers before sleeping.
- * On 4.19 the vector stub has already established the sleepable context. */
+ * On 4.19 the wrapper enables IRQs after tracking its lifetime. */
 static __always_inline enum lasx_trap_result lasx_user_trap(struct pt_regs* regs, int trapnr)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
@@ -1229,21 +1137,32 @@ static __always_inline enum lasx_trap_result lasx_user_trap(struct pt_regs* regs
 #endif
 }
 
-static asmlinkage void noinstr my_do_ri(struct pt_regs* regs)
+asmlinkage void noinstr my_do_ri(struct pt_regs* regs);
+asmlinkage void noinstr my_do_lasx(struct pt_regs* regs);
+asmlinkage void noinstr my_do_lbt(struct pt_regs* regs);
+
+asmlinkage void noinstr my_do_ri(struct pt_regs* regs)
 {
     struct lasx_active_trap active;
     lasx_trap_enter(&active);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    local_irq_enable();
+#endif
     if (!user_mode(regs) || lasx_user_trap(regs, EXCCODE_INE) != LASX_TRAP_HANDLED)
         orig_do_ri(regs);
+    local_irq_disable();
     lasx_trap_exit(&active);
 }
 
-static asmlinkage void noinstr my_do_lasx(struct pt_regs* regs)
+asmlinkage void noinstr my_do_lasx(struct pt_regs* regs)
 {
     enum lasx_trap_result result;
 
     struct lasx_active_trap active;
     lasx_trap_enter(&active);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    local_irq_enable();
+#endif
     result = user_mode(regs) ? lasx_user_trap(regs, EXCCODE_LASXDIS) : LASX_TRAP_NATIVE;
     if (result == LASX_TRAP_NATIVE) {
         lasx_noinstr_atomic_inc(&cnt_lasx_passthrough);
@@ -1251,115 +1170,114 @@ static asmlinkage void noinstr my_do_lasx(struct pt_regs* regs)
     } else if (result == LASX_TRAP_RI) {
         orig_do_ri(regs);
     }
+    local_irq_disable();
     lasx_trap_exit(&active);
 }
 
-static asmlinkage void noinstr my_do_lbt(struct pt_regs* regs)
+asmlinkage void noinstr my_do_lbt(struct pt_regs* regs)
 {
     enum lasx_trap_result result;
 
     struct lasx_active_trap active;
     lasx_trap_enter(&active);
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+    /* LBT can fault inside IRQ-off FP save/restore. Match the kernel KMODE
+     * entry: unlike RI/LASX, it preserves the interrupted IRQ state. */
+    if (regs->csr_prmd & CSR_PRMD_PIE)
+        local_irq_enable();
+#endif
     result = user_mode(regs) ? lasx_user_trap(regs, EXCCODE_BTDIS) : LASX_TRAP_NATIVE;
     if (result == LASX_TRAP_NATIVE)
         orig_do_lbt(regs);
     else if (result == LASX_TRAP_RI)
         orig_do_ri(regs);
+    local_irq_disable();
     lasx_trap_exit(&active);
 }
 
-struct cpu_verify_ctx {
-    atomic_t err_count;
-    unsigned long fn_ri;
-    unsigned long fn_lasx;
-    unsigned long fn_lbt;
-};
-
-static void verify_eentry_on_cpu(void* arg)
+static bool local_vectors_match(bool allow_patched)
 {
-    struct cpu_verify_ctx* vctx = arg;
     unsigned long eentry = csr_read64(LOONGARCH_CSR_EENTRY);
-    unsigned long fn_ri = 0, fn_lasx = 0, fn_lbt = 0;
+    const void *ri, *lbt, *lasx;
 
-    if (!eentry || decode_and_verify_vec_target(eentry, EXCCODE_INE, &fn_ri, NULL) != 0 || decode_and_verify_vec_target(eentry, EXCCODE_BTDIS, &fn_lbt, NULL) != 0 || fn_ri != vctx->fn_ri ||
-        fn_lbt != vctx->fn_lbt) {
-        atomic_inc(&vctx->err_count);
-        return;
-    }
-
-    if (g_patch_lasxdis) {
-        if (decode_and_verify_vec_target(eentry, EXCCODE_LASXDIS, &fn_lasx, NULL) != 0 || fn_lasx != vctx->fn_lasx) {
-            atomic_inc(&vctx->err_count);
-        }
-    }
+    if (!eentry || local_vec_stride() != vec_stride)
+        return false;
+    ri = (void*)(eentry + EXCCODE_INE * vec_stride);
+    lbt = (void*)(eentry + EXCCODE_BTDIS * vec_stride);
+    lasx = (void*)(eentry + EXCCODE_LASXDIS * vec_stride);
+#define ENTRY_MATCH(p, name) (!memcmp(p, saved_##name##_insns, sizeof(saved_##name##_insns)) || \
+    (allow_patched && !memcmp(p, patched_##name##_insns, sizeof(patched_##name##_insns))))
+    return ENTRY_MATCH(ri, ri) && ENTRY_MATCH(lbt, lbt) && (!g_patch_lasxdis || ENTRY_MATCH(lasx, lasx));
+#undef ENTRY_MATCH
 }
 
 struct sm_patch_req {
-    bool patch_lasx;
-    u32 lasx_insns[4];
-    u32 lbt_insns[4];
-    u32 ri_insns[4];
+    bool restore;
+    atomic_t checked, errors;
 };
 
 static void write_local_eentry_vectors(const struct sm_patch_req* req)
 {
     unsigned long eentry = csr_read64(LOONGARCH_CSR_EENTRY);
-    u32* vec_lbt = (u32*)(eentry + (unsigned long)EXCCODE_BTDIS * VEC_SLOT_STRIDE);
+    u32 *ri = (void*)(eentry + EXCCODE_INE * vec_stride);
+    u32 *lbt = (void*)(eentry + EXCCODE_BTDIS * vec_stride);
+    u32 *lasx = (void*)(eentry + EXCCODE_LASXDIS * vec_stride);
+    const u32 *ri_insns = req->restore ? saved_ri_insns : patched_ri_insns;
+    const u32 *lbt_insns = req->restore ? saved_lbt_insns : patched_lbt_insns;
+    const u32 *lasx_insns = req->restore ? saved_lasx_insns : patched_lasx_insns;
     int i;
 
-    u32* vec_ri = (u32*)(eentry + (unsigned long)EXCCODE_INE * VEC_SLOT_STRIDE);
-    for (i = 0; i < 4; i++)
-        WRITE_ONCE(vec_ri[vec_move_idx(EXCCODE_INE) + 1 + i], req->ri_insns[i]);
-    for (i = 0; i < 4; i++)
-        WRITE_ONCE(vec_lbt[vec_move_idx(EXCCODE_BTDIS) + 1 + i], req->lbt_insns[i]);
-
-    if (req->patch_lasx) {
-        u32* vec_lasx = (u32*)(eentry + (unsigned long)EXCCODE_LASXDIS * VEC_SLOT_STRIDE);
-        for (i = 0; i < 4; i++)
-            WRITE_ONCE(vec_lasx[vec_move_idx(EXCCODE_LASXDIS) + 1 + i], req->lasx_insns[i]);
+    for (i = 0; i < VEC_ENTRY_WORDS; i++) {
+        WRITE_ONCE(ri[i], ri_insns[i]);
+        WRITE_ONCE(lbt[i], lbt_insns[i]);
+        if (g_patch_lasxdis)
+            WRITE_ONCE(lasx[i], lasx_insns[i]);
     }
-
     __asm__ volatile("dbar 0\n\tibar 0" ::: "memory");
 }
 
 static int apply_vector_patch_sm(void* arg)
 {
-    write_local_eentry_vectors((const struct sm_patch_req*)arg);
+    struct sm_patch_req* req = arg;
+    if (!req->restore) {
+        if (!local_vectors_match(false))
+            atomic_inc(&req->errors);
+        smp_mb(); /* Publish errors before the relaxed completion counter. */
+        atomic_inc(&req->checked);
+        /* All callbacks run with IRQs off under the CPU hotplug lock. Verify
+         * every original table before any CPU starts writing a prefix. */
+        while (atomic_read(&req->checked) != num_online_cpus())
+            cpu_relax();
+        smp_mb(); /* Acquire every CPU's result before checking or writing. */
+        if (atomic_read(&req->errors))
+            return -EINVAL;
+    }
+    write_local_eentry_vectors(req);
+    WRITE_ONCE(vectors_live, !req->restore);
     return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
 static void lasx_sync_trap_returns(void* unused) { (void)unused; }
-#endif
 
-/* Re-apply per-CPU CSR_EENTRY patch when a CPU comes online (suspend/resume or hotplug) */
+static void drain_trap_returns(void)
+{
+    while (atomic_read(&active_traps))
+        msleep(1);
+    /* The counter is dropped with IRQs off. This IPI waits for assembly exits. */
+    on_each_cpu(lasx_sync_trap_returns, NULL, 1);
+}
+
+/* Online callbacks run on the new CPU before it can return to user mode.
+ * Its table is either the already-patched shared table or an original copy. */
 static int lasx_cpu_online(unsigned int cpu)
 {
-    unsigned long eentry = csr_read64(LOONGARCH_CSR_EENTRY);
-    unsigned long fn_lbt = 0, fn_lasx = 0;
-    unsigned long fn_ri = 0;
     unsigned long flags;
-    struct sm_patch_req req;
-
+    struct sm_patch_req req = { .restore = false };
     (void)cpu;
-    if (!eentry)
+    if (!READ_ONCE(vectors_live))
         return 0;
-
-    if (decode_and_verify_vec_target(eentry, EXCCODE_INE, &fn_ri, NULL) != 0 ||
-        (fn_ri != (unsigned long)orig_do_ri && fn_ri != (unsigned long)my_do_ri))
-        return 0;
-    if (decode_and_verify_vec_target(eentry, EXCCODE_BTDIS, &fn_lbt, NULL) != 0)
-        return 0;
-    if (fn_lbt == (unsigned long)my_do_lbt && (!g_patch_lasxdis))
-        return 0;
-    if (g_patch_lasxdis && decode_and_verify_vec_target(eentry, EXCCODE_LASXDIS, &fn_lasx, NULL) != 0)
-        return 0;
-
-    req.patch_lasx = g_patch_lasxdis;
-    memcpy(req.lasx_insns, patched_lasx_insns, sizeof(patched_lasx_insns));
-    memcpy(req.lbt_insns, patched_lbt_insns, sizeof(patched_lbt_insns));
-    memcpy(req.ri_insns, patched_ri_insns, sizeof(patched_ri_insns));
-
+    if (!local_vectors_match(true))
+        return -EINVAL;
     local_irq_save(flags);
     write_local_eentry_vectors(&req);
     local_irq_restore(flags);
@@ -1370,8 +1288,6 @@ static int __init lasx2lsx_kmod_init(void)
 {
     char cpu_model[16];
     unsigned long local_eentry;
-    unsigned long fn_ri = 0, fn_lasx = 0, fn_lbt = 0;
-    struct cpu_verify_ctx vctx;
     struct sm_patch_req req;
     int ret;
 
@@ -1383,74 +1299,53 @@ static int __init lasx2lsx_kmod_init(void)
     if (ret)
         return ret;
 
+    ret = init_kernel_symbols();
+    if (ret)
+        return ret;
     local_eentry = csr_read64(LOONGARCH_CSR_EENTRY);
-    if (!local_eentry) {
-        pr_err("lasx2lsx: CSR_EENTRY is NULL\n");
+    vec_stride = local_vec_stride();
+    if (!local_eentry || vec_stride < VEC_ENTRY_WORDS * sizeof(u32)) {
+        pr_err("lasx2lsx: unsupported EENTRY/ECFG.VS configuration\n");
         return -EINVAL;
     }
-
-    ret = decode_and_verify_vec_target(local_eentry, EXCCODE_INE, &fn_ri, saved_ri_insns);
-    if (ret)
-        return ret;
-    ret = decode_and_verify_vec_target(local_eentry, EXCCODE_BTDIS, &fn_lbt, saved_lbt_insns);
-    if (ret)
-        return ret;
-    if (g_patch_lasxdis) {
-        ret = decode_and_verify_vec_target(local_eentry, EXCCODE_LASXDIS, &fn_lasx, saved_lasx_insns);
-        if (ret)
-            return ret;
-    }
-
-    atomic_set(&vctx.err_count, 0);
-    vctx.fn_ri = fn_ri;
-    vctx.fn_lasx = fn_lasx;
-    vctx.fn_lbt = fn_lbt;
-    on_each_cpu(verify_eentry_on_cpu, &vctx, 1);
-    if (atomic_read(&vctx.err_count) != 0) {
-        pr_err("lasx2lsx: per-CPU CSR_EENTRY verification failed\n");
-        return -EINVAL;
-    }
-
-    orig_do_ri = (loongarch_exc_fn_t)fn_ri;
-    orig_do_lasx = (loongarch_exc_fn_t)fn_lasx;
-    orig_do_lbt = (loongarch_exc_fn_t)fn_lbt;
-
+    memcpy(saved_ri_insns, (void*)(local_eentry + EXCCODE_INE * vec_stride), sizeof(saved_ri_insns));
+    memcpy(saved_lbt_insns, (void*)(local_eentry + EXCCODE_BTDIS * vec_stride), sizeof(saved_lbt_insns));
+    if (g_patch_lasxdis)
+        memcpy(saved_lasx_insns, (void*)(local_eentry + EXCCODE_LASXDIS * vec_stride), sizeof(saved_lasx_insns));
+    encode_vector_entry((unsigned long)lasx_entry_ri, patched_ri_insns);
+    encode_vector_entry((unsigned long)lasx_entry_lbt, patched_lbt_insns);
+    encode_vector_entry((unsigned long)lasx_entry_lasx, patched_lasx_insns);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-    ret = init_irqentry(fn_ri, fn_lbt, fn_lasx);
-    if (ret)
-        return ret;
     ret = register_task_exit();
     if (ret)
         return ret;
 #endif
-    encode_t0_imm64((unsigned long)my_do_ri, patched_ri_insns);
-
-    encode_t0_imm64((unsigned long)my_do_lasx, patched_lasx_insns);
-    encode_t0_imm64((unsigned long)my_do_lbt, patched_lbt_insns);
-
-    req.patch_lasx = g_patch_lasxdis;
-    memcpy(req.lasx_insns, patched_lasx_insns, sizeof(patched_lasx_insns));
-    memcpy(req.lbt_insns, patched_lbt_insns, sizeof(patched_lbt_insns));
-    memcpy(req.ri_insns, patched_ri_insns, sizeof(patched_ri_insns));
-
+    /* Register before publishing hooks: registration failure cannot leave
+     * injected mmu_notifiers behind in a module whose init then fails. The
+     * callback stays idle until stop_machine has installed all entries. */
+    ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "loongarch/lasx2lsx:online", lasx_cpu_online, NULL);
+    if (ret < 0)
+        goto fail_trace;
+    g_cpuhp_state = (enum cpuhp_state)ret;
+    g_cpuhp_registered = true;
+    req.restore = false;
+    atomic_set(&req.checked, 0);
+    atomic_set(&req.errors, 0);
     ret = stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
     if (ret) {
-        pr_err("lasx2lsx: stop_machine vector patch failed: %d\n", ret);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-        unregister_task_exit();
-#endif
-        return ret;
-    }
-
-    ret = cpuhp_setup_state_nocalls(CPUHP_AP_ONLINE_DYN, "loongarch/lasx2lsx:online", lasx_cpu_online, NULL);
-    if (ret > 0) {
-        g_cpuhp_state = (enum cpuhp_state)ret;
-        g_cpuhp_registered = true;
+        cpuhp_remove_state_nocalls(g_cpuhp_state);
+        g_cpuhp_registered = false;
+        goto fail_trace;
     }
 
     pr_info("lasx2lsx: initialized on %s (%u CPUs, mode=%s, target_comm='%s', rt=%luKB)\n", cpu_model[0] ? cpu_model : "LA364", num_online_cpus(), g_patch_lasxdis ? "3A6000-sim" : "3B6000M/2K3000",
             target_comm[0] ? target_comm : "<all>", LASX_RT_FILE_SIZE / 1024UL);
     return 0;
+fail_trace:
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+    unregister_task_exit();
+#endif
+    return ret;
 }
 
 static void __exit lasx2lsx_kmod_exit(void)
@@ -1465,27 +1360,11 @@ static void __exit lasx2lsx_kmod_exit(void)
         g_cpuhp_registered = false;
     }
 
-    req.patch_lasx = g_patch_lasxdis;
-    memcpy(req.lasx_insns, saved_lasx_insns, sizeof(saved_lasx_insns));
-    memcpy(req.lbt_insns, saved_lbt_insns, sizeof(saved_lbt_insns));
-    memcpy(req.ri_insns, saved_ri_insns, sizeof(saved_ri_insns));
-
+    req.restore = true;
     stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
-    /* No new wrappers can start; wait for sleeping handlers and their returns. */
-    wait_event(active_traps_wait, atomic_read(&active_traps) == 0);
-    synchronize_sched();
-#endif
+    drain_trap_returns();
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
-    /* Wrappers leave with IRQs off, so no new entry can slip past the counter
-     * after stop_machine restores the vectors. Their cores may have slept. */
-    while (atomic_read(&active_traps))
-        msleep(1);
     unregister_task_exit();
-    /* A CPU may still be executing the IRQ-off epilogue after decrementing.
-     * A synchronous IPI cannot run there until it has left the wrapper. */
-    on_each_cpu(lasx_sync_trap_returns, NULL, 1);
 #endif
 
     /* Unregister mmu_notifiers for any still-running processes */

@@ -520,7 +520,7 @@ deb-dkms: kmod-rt
 	sed 's/@PACKAGE_VERSION@/$(DEB_VERSION)/g' kmod/dkms.conf.in \
 		> debian/pkg-dkms/$(DKMS_SRC_SUBDIR)/dkms.conf
 	cp kmod/Makefile kmod/Kbuild kmod/lasx_kproto.h kmod/lasx_rt_meta.h \
-		kmod/lasx_rt.bin kmod/lasx_rt_blob.S kmod/lasx2lsx_kmod.c \
+		kmod/lasx_rt.bin kmod/lasx_rt_blob.S kmod/lasx_entry.S kmod/lasx2lsx_kmod.c \
 		debian/pkg-dkms/$(DKMS_SRC_SUBDIR)/
 	cp kmod/lasx2lsx.service debian/pkg-dkms/usr/lib/systemd/system/
 	cp debian/copyright debian/pkg-dkms/usr/share/doc/liblasx2lsx-dkms/copyright
