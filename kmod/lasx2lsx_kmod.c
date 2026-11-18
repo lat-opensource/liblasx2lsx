@@ -52,9 +52,9 @@
 #include <linux/stop_machine.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
-#include <linux/version.h>
+#include "lasx_entry_compat.h"
 #include <linux/wait.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
 #include <linux/entry-common.h>
 #include <linux/tracepoint.h>
 #include <trace/events/sched.h>
@@ -282,7 +282,7 @@ unsigned long lasx_kernelsp;
 unsigned long lasx_ret_from_exception;
 extern void lasx_entry_ri(void), lasx_entry_lbt(void), lasx_entry_lasx(void);
 static atomic_t active_traps = ATOMIC_INIT(0);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
 static irqentry_state_t (*kernel_irqentry_enter)(struct pt_regs*);
 static void (*kernel_irqentry_exit)(struct pt_regs*, irqentry_state_t);
 #endif
@@ -290,13 +290,13 @@ static void (*kernel_irqentry_exit)(struct pt_regs*, irqentry_state_t);
 /* A modern irqentry exit can terminate the task instead of returning. Keep
  * stack frames on this short list so sched_process_exit can release them. */
 struct lasx_active_trap {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     struct lasx_active_trap *next, **prev;
     struct task_struct* task;
 #endif
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
 static struct lasx_active_trap* active_head;
 static atomic_t active_lock = ATOMIC_INIT(0);
 static struct tracepoint* task_exit_tp;
@@ -308,22 +308,14 @@ static __always_inline unsigned long lasx_active_lock(void)
 {
     unsigned long flags;
     raw_local_irq_save(flags);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
     while (raw_atomic_cmpxchg_acquire(&active_lock, 0, 1))
-#else
-    while (atomic_cmpxchg_acquire(&active_lock, 0, 1))
-#endif
         cpu_relax();
     return flags;
 }
 
 static __always_inline void lasx_active_unlock(unsigned long flags)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
     raw_atomic_set_release(&active_lock, 0);
-#else
-    atomic_set_release(&active_lock, 0);
-#endif
     raw_local_irq_restore(flags);
 }
 
@@ -332,11 +324,7 @@ static __always_inline void lasx_untrack_trap(struct lasx_active_trap* trap)
     *trap->prev = trap->next;
     if (trap->next)
         trap->next->prev = trap->prev;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
     raw_atomic_dec(&active_traps);
-#else
-    atomic_dec(&active_traps);
-#endif
 }
 
 static void lasx_task_exit(void* unused, struct task_struct* task)
@@ -396,7 +384,7 @@ static void unregister_task_exit(void)
 
 static void noinstr lasx_trap_exit(struct lasx_active_trap* trap)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     unsigned long flags = lasx_active_lock();
     lasx_untrack_trap(trap);
     lasx_active_unlock(flags);
@@ -408,7 +396,7 @@ static void noinstr lasx_trap_exit(struct lasx_active_trap* trap)
 
 static __always_inline void lasx_trap_enter(struct lasx_active_trap* trap)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     unsigned long flags = lasx_active_lock();
     trap->task = current;
     trap->next = active_head;
@@ -416,11 +404,7 @@ static __always_inline void lasx_trap_enter(struct lasx_active_trap* trap)
     if (active_head)
         active_head->prev = &trap->next;
     active_head = trap;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
     raw_atomic_inc(&active_traps);
-#else
-    atomic_inc(&active_traps);
-#endif
     lasx_active_unlock(flags);
 #else
     (void)trap;
@@ -467,7 +451,7 @@ static int init_kernel_symbols(void)
     orig_do_lbt = (void*)lookup("do_lbt");
     if (g_patch_lasxdis)
         orig_do_lasx = (void*)lookup("do_lasx");
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     kernel_irqentry_enter = (void*)lookup("irqentry_enter");
     kernel_irqentry_exit = (void*)lookup("irqentry_exit");
     if (!kernel_irqentry_enter || !kernel_irqentry_exit)
@@ -1110,10 +1094,10 @@ static enum lasx_trap_result lasx_handle_trap(struct pt_regs* regs, int trapnr)
 
 /* Modern vector stubs enter with IRQs off and context tracking still in user
  * mode. Establish the same boundary as the original C handlers before sleeping.
- * On 4.19 the wrapper enables IRQs after tracking its lifetime. */
+ * On the legacy path the wrapper enables IRQs after tracking its lifetime. */
 static __always_inline enum lasx_trap_result lasx_user_trap(struct pt_regs* regs, int trapnr)
 {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     irqentry_state_t state = kernel_irqentry_enter(regs);
     enum lasx_trap_result result;
     unsigned long resume_pc;
@@ -1145,7 +1129,7 @@ asmlinkage void noinstr my_do_ri(struct pt_regs* regs)
 {
     struct lasx_active_trap active;
     lasx_trap_enter(&active);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+#if !LASX_USE_IRQENTRY
     local_irq_enable();
 #endif
     if (!user_mode(regs) || lasx_user_trap(regs, EXCCODE_INE) != LASX_TRAP_HANDLED)
@@ -1160,7 +1144,7 @@ asmlinkage void noinstr my_do_lasx(struct pt_regs* regs)
 
     struct lasx_active_trap active;
     lasx_trap_enter(&active);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+#if !LASX_USE_IRQENTRY
     local_irq_enable();
 #endif
     result = user_mode(regs) ? lasx_user_trap(regs, EXCCODE_LASXDIS) : LASX_TRAP_NATIVE;
@@ -1180,7 +1164,7 @@ asmlinkage void noinstr my_do_lbt(struct pt_regs* regs)
 
     struct lasx_active_trap active;
     lasx_trap_enter(&active);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+#if !LASX_USE_IRQENTRY
     /* LBT can fault inside IRQ-off FP save/restore. Match the kernel KMODE
      * entry: unlike RI/LASX, it preserves the interrupted IRQ state. */
     if (regs->csr_prmd & CSR_PRMD_PIE)
@@ -1291,8 +1275,8 @@ static int __init lasx2lsx_kmod_init(void)
     struct sm_patch_req req;
     int ret;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0) && defined(CONFIG_PREEMPT)
-    pr_err("lasx2lsx: preemptible 4.19 kernels are not supported\n");
+#if !LASX_USE_IRQENTRY && defined(CONFIG_PREEMPT)
+    pr_err("lasx2lsx: preemptible kernels with legacy exception entry are not supported\n");
     return -EOPNOTSUPP;
 #endif
     ret = lasx_check_platform(cpu_model);
@@ -1315,7 +1299,7 @@ static int __init lasx2lsx_kmod_init(void)
     encode_vector_entry((unsigned long)lasx_entry_ri, patched_ri_insns);
     encode_vector_entry((unsigned long)lasx_entry_lbt, patched_lbt_insns);
     encode_vector_entry((unsigned long)lasx_entry_lasx, patched_lasx_insns);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     ret = register_task_exit();
     if (ret)
         return ret;
@@ -1342,7 +1326,7 @@ static int __init lasx2lsx_kmod_init(void)
             target_comm[0] ? target_comm : "<all>", LASX_RT_FILE_SIZE / 1024UL);
     return 0;
 fail_trace:
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     unregister_task_exit();
 #endif
     return ret;
@@ -1363,7 +1347,7 @@ static void __exit lasx2lsx_kmod_exit(void)
     req.restore = true;
     stop_machine(apply_vector_patch_sm, &req, cpu_online_mask);
     drain_trap_returns();
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     unregister_task_exit();
 #endif
 

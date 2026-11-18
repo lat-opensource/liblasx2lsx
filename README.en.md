@@ -131,7 +131,7 @@ The entire process is transparent to the target program — no code modification
 
 For system-wide transparent compatibility (e.g. desktop launchers that strip `LD_PRELOAD`, wrapper scripts, `-static` binaries, or Go/JVM/browser runtimes with custom `SIGILL` handlers), install `liblasx2lsx-dkms`:
 
-The module calculates exception entries from `EENTRY` and `ECFG.VS`, saves their first 28 bytes, and jumps to its own register-save assembly without scanning or matching kernel instructions. Register-frame offsets come from the installed kernel's generated headers. On 4.19, a non-preemptible configuration is still required. Tested in 3A6000 simulation mode on Loongnix `4.19.0-19-loongson-3`.
+The module calculates exception entries from `EENTRY` and `ECFG.VS`, saves their first 28 bytes, and jumps to its own register-save assembly without scanning or matching kernel instructions. Register-frame offsets come from the installed kernel's generated headers. Kernels before 5.17 use the legacy exception return path and require a non-preemptible configuration. Tested in 3A6000 simulation mode on Loongnix `4.19.0-19-loongson-3`. Kylin Industry V10 SP1 with `5.4.18-152-generic` also uses the legacy path.
 
 `CONFIG_KALLSYMS_ALL` is required to resolve `kernelsp` and original handlers by name. Kernels since 5.7 also require `CONFIG_KPROBES`; modern kernels also require `CONFIG_TRACEPOINTS` to release active handlers terminated by fatal signals. Missing symbols or a shared exception entry (`ECFG.VS=0`) cause initialization to fail. Modern handlers establish the sleepable kernel context through `irqentry_enter/exit`. Tested in 3A6000 simulation mode on AOSC `6.18.27`.
 

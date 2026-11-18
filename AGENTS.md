@@ -1099,3 +1099,5 @@ env -i ./kmod/tests/test_lasx_fork
 - `lasx_entry.S` 用安装内核的生成偏移构造 `pt_regs`，经按名称查找的 `kernelsp` 切换用户/内核栈（要求 `CONFIG_KALLSYMS_ALL`）。4.19返回 `ret_from_exception`；新版调用 `irqentry_enter/exit` 后自行恢复现场并 `ertn`。
 - 活动计数递减到汇编返回之间必须关中断；恢复原向量、等待活动计数归零后，再用同步IPI等待汇编尾部退出。测试 `test_lasx_regs` 覆盖全部非零GPR经过LASX/LBT首次陷阱的保存恢复，可分别用匹配/不匹配的名称过滤检查翻译与原生回退。
 - 4.19 的 LBT 入口须按 `PRMD.PIE` 保持原中断状态；内核 FP 保存/恢复时可在关中断状态触发 LBT 异常。现代返回仅对用户态恢复 r21，内核态须保留调度更新的 CPU 基址。安装时在发布各 CPU 完成计数前和等待全部完成后均用 `smp_mb()`，不可将 `atomic_inc()` 当作内存屏障。
+
+- 麒麟工业版 V10 SP1 的 `5.4.18-152-generic` 与 4.19 使用同一旧异常返回路径。C 与汇编共享 `lasx_entry_compat.h` 中的 5.17 分界，旧入口仅支持非抢占配置。符号查找和内存管理接口仍按各自的内核版本判断。

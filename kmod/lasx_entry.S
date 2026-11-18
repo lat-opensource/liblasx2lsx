@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /* Hardware vector prefix has already saved t0/t1 in KS0/KS1. IRQs stay off
  * until pt_regs, kernel tp and the per-CPU register are ready for C code.
- * Use the installed kernel's generated offsets (including vendor 4.19). */
-#include <linux/version.h>
+ * Use the installed kernel's generated offsets (including vendor 4.19 and 5.4). */
+#include "lasx_entry_compat.h"
 #include <generated/asm-offsets.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0) && __has_include(<asm/unwind_hints.h>)
+#if LASX_USE_IRQENTRY && __has_include(<asm/unwind_hints.h>)
 #include <asm/unwind_hints.h>
 #else
     .macro UNWIND_HINT_UNDEFINED
@@ -15,7 +15,7 @@
     .endm
 #endif
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 0, 0)
+#if LASX_USE_IRQENTRY
     .section .noinstr.text,"ax"
 #else
     .text
@@ -111,11 +111,11 @@
     LASX_ENTRY lasx_entry_lasx, my_do_lasx
 
 /* C drops the active count with IRQs off; unload sends an IPI to wait for
- * these last instructions too. 4.19 still does pending work in its asm exit. */
+ * these last instructions too. Legacy kernels do pending work in their asm exit. */
     .type lasx_entry_return, @function
 lasx_entry_return:
     UNWIND_HINT_REGS
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
+#if !LASX_USE_IRQENTRY
     la.pcrel $r12, lasx_ret_from_exception
     ld.d $r12, $r12, 0
     jirl $r0, $r12, 0
